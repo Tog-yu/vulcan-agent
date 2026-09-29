@@ -1,70 +1,74 @@
 /**
- * Harness 任务编排层（技术方案 · 一/七/八 的粘合层）
+ * Harness 任务编排层（DEV_SPEC §14 P1-7）。
  *
- * 职责：消费归一化事件 → 校验/权限/路由 → 建 VulcanTask → 派发给对应链路。
- * 口径：确定的流程交给程序，需要探索的步骤交给 Agent，不确定的决策交给人。
+ * 职责边界：
+ *   - 从队列消费 InternalEvent → 按 source 路由到对应 handler → 建/更新 VulcanTask
+ *   - 状态流转全部走确定性流转表（state-machine.ts），非法流转抛错并告警
+ *   - 确定的流程交给程序，需要探索的步骤交给 Agent，不确定的决策交给人
  */
 
-import type { EventQueue } from "../gateway/queue.ts";
-import type { InternalEvent, VulcanTask } from "../types.ts";
+import type { DatabaseSync } from "node:sqlite";
+import type { InternalEvent } from "../types.ts";
+import { transitionTask, canTransition, IllegalTransitionError } from "./state-machine.ts";
+import type { TaskStatus } from "../types.ts";
+
+export type RouteHandler = (event: InternalEvent, taskId: string) => Promise<void>;
 
 export interface HarnessDeps {
-	queue: EventQueue;
+	db: DatabaseSync;
+	/** 三来源业务 handler（P2 起由 alerthandler/meegle/approval 实现） */
+	routes: Partial<Record<InternalEvent["source"], RouteHandler>>;
+	/** 告警挂点：非法流转等编排异常 */
+	onWarn?: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
 export class Harness {
-	readonly #deps: HarnessDeps;
-	readonly #tasks = new Map<string, VulcanTask>();
-	#timer?: NodeJS.Timeout;
+	private readonly deps: HarnessDeps;
 
 	constructor(deps: HarnessDeps) {
-		this.#deps = deps;
+		this.deps = deps;
 	}
 
-	start(pollMs = 500): void {
-		this.#timer = setInterval(() => void this.poll(), pollMs);
+	/** 幂等建任务：同 (source, ref) 已存在任务则复用，不重复建（P2-2 关联语义的前置） */
+	getOrCreateTask(event: InternalEvent): { taskId: string; created: boolean } {
+		const existing = this.deps.db
+			.prepare("SELECT id FROM tasks WHERE source = ? AND ref = ? ORDER BY created_at DESC LIMIT 1")
+			.get(event.source, event.ref) as { id: string } | undefined;
+		if (existing) return { taskId: existing.id, created: false };
+
+		const id = `task-${event.source}-${event.ref}-${Date.now()}`;
+		const now = Date.now();
+		this.deps.db
+			.prepare(
+				"INSERT INTO tasks (id, source, ref, status, created_at, updated_at) VALUES (?, ?, ?, 'received', ?, ?)",
+			)
+			.run(id, event.source, event.ref, now, now);
+		return { taskId: id, created: true };
 	}
 
-	stop(): void {
-		if (this.#timer) clearInterval(this.#timer);
-	}
-
-	async poll(): Promise<void> {
-		for (const event of this.#deps.queue.drain()) {
-			try {
-				this.route(event);
-			} catch (err) {
-				this.#deps.queue.deadLetter(event, String(err));
-			}
+	/** 处理一条事件：路由 + 状态推进（received → triaged → running 由对应链路推进） */
+	async handleEvent(event: InternalEvent): Promise<string> {
+		const { taskId } = this.getOrCreateTask(event);
+		const handler = this.deps.routes[event.source];
+		if (handler) {
+			await handler(event, taskId);
 		}
+		return taskId;
 	}
 
-	/** 按事件来源路由到三条链路之一（链路实现后续填充） */
-	route(event: InternalEvent): VulcanTask {
-		const task: VulcanTask = {
-			id: `task:${event.id}`,
-			source: event.source,
-			ref: event.ref,
-			status: "received",
-			createdAt: Date.now(),
-			updatedAt: Date.now(),
-		};
-		this.#tasks.set(task.id, task);
-		switch (event.source) {
-			case "alert":
-				// TODO: AlertHandler —— 去重降噪 / 分级 / 关联工单 / 触发修复链路
-				break;
-			case "meegle":
-				// TODO: MeegleService —— Open API 回查详情 → 任务整理 → 修复链路
-				break;
-			case "approval":
-				// TODO: ApprovalService —— 策略裁决 → 通过 / 驳回 / 转人工
-				break;
+	/** 确定性流转封装：非法流转记录告警并抛错（DEV_SPEC §14 P1-7 验收） */
+	transition(taskId: string, from: TaskStatus, to: TaskStatus): void {
+		if (!canTransition(from, to)) {
+			const err = new IllegalTransitionError(taskId, from, to);
+			this.deps.onWarn?.("非法状态流转被拒绝", { taskId, from, to });
+			throw err;
 		}
-		return task;
-	}
-
-	get(taskId: string): VulcanTask | undefined {
-		return this.#tasks.get(taskId);
+		const ok = transitionTask(this.deps.db, taskId, from, to);
+		if (!ok) {
+			// 前态不符：并发修改或状态已变，按非法流转处理
+			const err = new IllegalTransitionError(taskId, from, to);
+			this.deps.onWarn?.("状态前置条件不满足，流转拒绝", { taskId, from, to });
+			throw err;
+		}
 	}
 }

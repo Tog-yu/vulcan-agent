@@ -1,70 +1,74 @@
 /**
- * payload 归一化 —— 各来源原始 payload → InternalEvent。
- * 技术方案 七：下游只面向内部模型编程。
+ * payload 归一化：三来源 → InternalEvent（DEV_SPEC §14 P1-5，契约见 src/server/types.ts）。
+ *
+ * 未知/缺字段的 payload 显式拒绝（PermanentError），不做猜测性填充。
  */
 
-import type { AlertSeverity, EventSource, InternalEvent } from "../types.ts";
+import type { InternalEvent, EventSource } from "../types.ts";
+import { NormalizeError } from "./errors.ts";
 
-function baseEvent(
-	source: EventSource,
-	id: string,
-	type: string,
-	ref: string,
-	payload: Record<string, unknown>,
-	raw: unknown,
-): InternalEvent {
-	return { id: `${source}:${id}`, source, type, ref, occurredAt: Date.now(), payload, raw };
+function requireString(obj: Record<string, unknown>, key: string, label: string): string {
+	const v = obj[key];
+	if (typeof v !== "string" || v.length === 0) {
+		throw new NormalizeError(`${label}.${key} 缺失或非字符串`);
+	}
+	return v;
 }
 
-// ---------- alert ----------
-
-const SEVERITY_ORDER = ["critical", "high", "medium", "low"] as const;
-
-function asSeverity(v: unknown): AlertSeverity {
-	const s = String(v ?? "").toLowerCase();
-	return (SEVERITY_ORDER as readonly string[]).includes(s) ? (s as AlertSeverity) : "medium";
+/** meegle header.uuid 去重键（src/server/types.ts:45-49） */
+export function normalizeMeegle(payload: Record<string, unknown>): InternalEvent {
+	const header = payload.header as Record<string, unknown> | undefined;
+	if (!header || typeof header !== "object") {
+		throw new NormalizeError("meegle payload 缺少 header 段");
+	}
+	const body = (payload.payload as Record<string, unknown> | undefined) ?? {};
+	return {
+		id: requireString(header, "uuid", "meegle.header"),
+		source: "meegle",
+		type: `workitem.${header.event_type ?? "unknown"}`,
+		occurredAt: typeof body.updated_at === "number" ? body.updated_at : Date.now(),
+		ref: body.id !== undefined ? String(body.id) : requireString(header, "event_type", "meegle.header"),
+		payload: body,
+		raw: payload,
+	};
 }
 
-export function normalizeAlert(raw: unknown): InternalEvent {
-	const body = (raw ?? {}) as Record<string, unknown>;
-	// Alertmanager 风格：alerts[] + 通用字段；其余告警源在接入时补充适配
-	const alerts = Array.isArray(body.alerts) ? body.alerts : [body];
-	const first = (alerts[0] ?? {}) as Record<string, unknown>;
-	const labels = (first.labels ?? {}) as Record<string, string>;
-	const fingerprint = String(first.fingerprint ?? labels.alertname ?? crypto.randomUUID());
-	return baseEvent(
-		"alert",
-		fingerprint,
-		"alert.fired",
-		fingerprint,
-		{
-			severity: asSeverity(labels.severity ?? first.severity),
-			title: String(labels.alertname ?? first.title ?? "unknown alert"),
-			description: first.description,
-			service: labels.service,
-			labels,
-			groupSize: alerts.length,
-		},
-		raw,
-	);
+/** 告警：优先 fingerprint，缺失回退 title+startsAt 组合哈希语义（拼接，不引入依赖） */
+export function normalizeAlert(payload: Record<string, unknown>): InternalEvent {
+	const fingerprint = typeof payload.fingerprint === "string" && payload.fingerprint.length > 0
+		? payload.fingerprint
+		: `${payload.title ?? "unknown"}@${payload.startsAt ?? "unknown"}`;
+	return {
+		id: fingerprint,
+		source: "alert",
+		type: "alert.fired",
+		occurredAt: typeof payload.startsAt === "number" ? payload.startsAt : Date.now(),
+		ref: fingerprint,
+		payload,
+		raw: payload,
+	};
 }
 
-// ---------- meegle ----------
-
-/** 对齐 meegle webhook payload：{ header: { event_type, uuid, ... }, payload: { ... } } */
-export function normalizeMeegle(raw: unknown): InternalEvent {
-	const body = (raw ?? {}) as Record<string, unknown>;
-	const header = (body.header ?? {}) as Record<string, unknown>;
-	const payload = (body.payload ?? {}) as Record<string, unknown>;
-	const uuid = String(header.uuid ?? crypto.randomUUID());
-	const workItemId = payload.id ?? payload.work_item_id ?? "unknown";
-	return baseEvent("meegle", uuid, String(header.event_type ?? "workitem.unknown"), String(workItemId), payload, raw);
+/** 审批回调：以审批单号去重 */
+export function normalizeApproval(payload: Record<string, unknown>): InternalEvent {
+	return {
+		id: requireString(payload, "ticketId", "approval"),
+		source: "approval",
+		type: "approval.updated",
+		occurredAt: typeof payload.decidedAt === "number" ? payload.decidedAt : Date.now(),
+		ref: requireString(payload, "ticketId", "approval"),
+		payload,
+		raw: payload,
+	};
 }
 
-// ---------- approval ----------
-
-export function normalizeApproval(raw: unknown): InternalEvent {
-	const body = (raw ?? {}) as Record<string, unknown>;
-	const ticketId = String(body.ticket_id ?? body.ticketId ?? crypto.randomUUID());
-	return baseEvent("approval", ticketId, "approval.requested", ticketId, body, raw);
+export function normalizeEvent(source: EventSource, payload: Record<string, unknown>): InternalEvent {
+	switch (source) {
+		case "alert":
+			return normalizeAlert(payload);
+		case "meegle":
+			return normalizeMeegle(payload);
+		case "approval":
+			return normalizeApproval(payload);
+	}
 }
