@@ -156,6 +156,12 @@ MIGRATIONS.push({
 ALTER TABLE webhook_events DROP COLUMN attempts;`,
 });
 
+/** v5：approvals 裁决记录补 append-only（P2-6 验收：尝试修改被数据库拒绝） */
+{
+	const { up, down } = appendOnlyTriggers("approvals");
+	MIGRATIONS.push({ version: 5, name: "append-only-approvals", up, down });
+}
+
 export function openDb(dbPath: string): DatabaseSync {
 	return new DatabaseSync(dbPath);
 }
