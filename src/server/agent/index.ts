@@ -8,12 +8,10 @@
  * 依赖方向（§5）：harness → agent → cordis；agent 不得绕过 cordis 直接访问存储层。
  */
 
-import {
-	runAgentLoop,
-	type AgentEvent,
-	type AgentMessage,
-	type AgentTool,
-} from "@earendil-works/pi-agent-core";
+// ⚠️ pi-agent-core 只能 import type + 动态 import()：其传递依赖 typebox 的递归
+// barrel 模块图在 --experimental-strip-types ESM loader 下静态求值会无限挂起
+// （entry.ts 启动路径必须完全避开）。runAgentLoop 在 run() 内动态获取。
+import type { AgentEvent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, AssistantMessageEventStream, Model, Usage } from "@earendil-works/pi-ai";
 import type { ToolScope, ToolPlugin } from "../cordis/index.ts";
 
@@ -100,7 +98,11 @@ function toAgentTool(plugin: ToolPlugin, scope: ToolScope): AgentTool<any> {
 // ---------- 主循环 ----------
 
 export class VulcanAgentLoop {
-	constructor(private readonly deps: AgentRunDeps) {}
+	private readonly deps: AgentRunDeps;
+
+	constructor(deps: AgentRunDeps) {
+		this.deps = deps;
+	}
 
 	async run(input: AgentRunInput): Promise<AgentRunOutput> {
 		const budget: AgentBudget = { ...DEFAULT_BUDGET, ...input.budget };
@@ -162,6 +164,8 @@ export class VulcanAgentLoop {
 
 		let finalMessages: AgentMessage[];
 		try {
+			// 运行期才加载 pi-agent-core（静态导入会在模块求值期触发 typebox 挂死）
+			const { runAgentLoop } = await import("@earendil-works/pi-agent-core");
 			finalMessages = await runAgentLoop(
 				messages,
 				context,
