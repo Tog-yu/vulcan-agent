@@ -27,12 +27,13 @@ export interface MeegleClientOptions {
 }
 
 export class MeegleApiError extends Error {
-	constructor(
-		readonly status: number,
-		readonly method: string,
-		message: string,
-	) {
+	readonly status: number;
+	readonly method: string;
+
+	constructor(status: number, method: string, message: string) {
 		super(`meegle ${method} 失败（HTTP ${status}）：${message}`);
+		this.status = status;
+		this.method = method;
 	}
 }
 
