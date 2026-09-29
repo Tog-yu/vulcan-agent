@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type Model } from "@earendil-works/pi-ai";
-import { VulcanAgentLoop, type AgentRunDeps } from "../src/server/agent/index.ts";
+import { VulcanAgentLoop, applyBudgetOutcome, type AgentRunDeps } from "../src/server/agent/index.ts";
 import type { ToolPlugin, ToolResult } from "../src/server/cordis/index.ts";
 
 // ---------- mock 基建 ----------
@@ -175,5 +175,106 @@ describe("P3-2 Pi AgentLoop 接入", () => {
 		expect(out.usage.inputTokens).toBe(100);
 		expect(out.usage.outputTokens).toBe(50);
 		expect(out.usage.cost).toBeCloseTo(0.01);
+	});
+});
+
+describe("P3-3 预算强停（步数/Token/成本）", () => {
+	/** 无限脚本：每轮都要求继续调工具（模拟跑不完的循环）；响应 abort 信号（真实 streamFn 的契约） */
+	function endlessStreamFn(): AgentRunDeps["streamFn"] {
+		let call = 0;
+		return (_model, _ctx, options) => {
+			call += 1;
+			const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+			if (signal?.aborted) {
+				const aborted = assistantMsg([{ type: "text", text: "aborted" }], "aborted");
+				return streamOf(aborted);
+			}
+			return streamOf(assistantMsg(
+				[{ type: "toolCall", id: `c${call}`, name: "noop", arguments: { n: call } } as never],
+				"toolUse",
+			));
+		};
+	}
+
+	it("步数超限：强停 + endReason=budget_exceeded + 审计留痕", async () => {
+		const auditLog: Array<{ kind: string; detail: Record<string, unknown> }> = [];
+		const loop = new VulcanAgentLoop(makeDeps(endlessStreamFn(), auditLog));
+		const out = await loop.run({
+			prompt: "loop forever",
+			systemPrompt: "v",
+			tools: [mockTool("noop")],
+			scope: { allowedRepos: [], forbiddenPaths: [] },
+			budget: { maxSteps: 3 },
+		});
+		expect(out.endReason).toBe("budget_exceeded");
+		expect(out.usage.steps).toBeGreaterThan(3); // 超限那一刻被 abort
+		const hit = auditLog.find((e) => e.kind === "budget_exceeded" && e.detail.dimension === "steps");
+		expect(hit).toBeTruthy();
+		expect(hit!.detail.limit).toBe(3);
+		// trace 完整：transcript 保留全程消息（含被 abort 前的 toolResult）
+		expect(out.messages.length).toBeGreaterThan(3);
+	});
+
+	/** 超限循环工厂：每轮吐一条带指定 usage 的 toolUse 消息；响应 abort（真实 streamFn 契约） */
+	function loopingStreamFn(usage?: Partial<AssistantMessage["usage"]>): AgentRunDeps["streamFn"] {
+		let call = 0;
+		return (_model, _ctx, options) => {
+			call += 1;
+			const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+			if (signal?.aborted) {
+				return streamOf(assistantMsg([{ type: "text", text: "aborted" }], "aborted"));
+			}
+			return streamOf(assistantMsg(
+				[{ type: "toolCall", id: `c${call}`, name: "noop", arguments: {} } as never],
+				"toolUse",
+				usage,
+			));
+		};
+	}
+
+	it("Token 超限：强停 + 审计", async () => {
+		const auditLog: Array<{ kind: string; detail: Record<string, unknown> }> = [];
+		// 每轮 input 80 + output 60 = 140 tokens，预算 200 → 第 2 轮超限
+		const loop = new VulcanAgentLoop(makeDeps(loopingStreamFn({ input: 80, output: 60 }), auditLog));
+		const out = await loop.run({
+			prompt: "loop", systemPrompt: "v", tools: [mockTool("noop")],
+			scope: { allowedRepos: [], forbiddenPaths: [] },
+			budget: { maxTokens: 200, maxSteps: 100 },
+		});
+		expect(out.endReason).toBe("budget_exceeded");
+		const hit = auditLog.find((e) => e.kind === "budget_exceeded" && e.detail.dimension === "tokens");
+		expect(hit).toBeTruthy();
+		expect(out.usage.inputTokens + out.usage.outputTokens).toBeGreaterThan(200);
+	});
+
+	it("成本超限：强停 + 审计", async () => {
+		const auditLog: Array<{ kind: string; detail: Record<string, unknown> }> = [];
+		const loop = new VulcanAgentLoop(makeDeps(loopingStreamFn({ cost: { total: 0.5 } as never }), auditLog));
+		const out = await loop.run({
+			prompt: "loop", systemPrompt: "v", tools: [mockTool("noop")],
+			scope: { allowedRepos: [], forbiddenPaths: [] },
+			budget: { maxCost: 1.0, maxSteps: 100 },
+		});
+		expect(out.endReason).toBe("budget_exceeded");
+		const hit = auditLog.find((e) => e.kind === "budget_exceeded" && e.detail.dimension === "cost");
+		expect(hit).toBeTruthy();
+	});
+
+	it("编排层联动：applyBudgetOutcome 按结果分发（预算超限 → 任务转 failed）", async () => {
+		const auditLog: Array<{ kind: string; detail: Record<string, unknown> }> = [];
+		const loop = new VulcanAgentLoop(makeDeps(endlessStreamFn(), auditLog));
+		const out = await loop.run({
+			prompt: "loop", systemPrompt: "v", tools: [mockTool("noop")],
+			scope: { allowedRepos: [], forbiddenPaths: [] },
+			budget: { maxSteps: 2 },
+		});
+		// 模拟编排层：endReason=budget_exceeded → running → failed
+		let taskFailed = false;
+		applyBudgetOutcome(out.endReason, out.usage, {
+			onCompleted: () => { taskFailed = false; },
+			onBudgetExceeded: () => { taskFailed = true; },
+			onAborted: () => { taskFailed = false; },
+		});
+		expect(taskFailed).toBe(true);
 	});
 });

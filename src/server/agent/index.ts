@@ -202,5 +202,35 @@ export class VulcanAgentLoop {
 	}
 }
 
+/**
+ * 预算强停的编排层联动（P3-3 验收：任务被强停转 failed，trace 完整）。
+ * AgentLoop 负责 abort + 审计；任务状态转换属于编排层职责（§5 依赖方向），
+ * 由调用方在 run() 返回后按 endReason 处理。
+ */
+export function applyBudgetOutcome(
+	endReason: AgentRunOutput["endReason"],
+	usage: AgentRunOutput["usage"],
+	handlers: {
+		/** endReason=completed */
+		onCompleted?: () => void;
+		/** endReason=budget_exceeded：编排层把任务 running → failed */
+		onBudgetExceeded?: (usage: AgentRunOutput["usage"]) => void;
+		/** endReason=aborted：外部取消，编排层决定语义（重试/转人工） */
+		onAborted?: () => void;
+	},
+): void {
+	switch (endReason) {
+		case "completed":
+			handlers.onCompleted?.();
+			break;
+		case "budget_exceeded":
+			handlers.onBudgetExceeded?.(usage);
+			break;
+		case "aborted":
+			handlers.onAborted?.();
+			break;
+	}
+}
+
 // re-export 给类型消费者
 export type { ToolScope, ToolPlugin };

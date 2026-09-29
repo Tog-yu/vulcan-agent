@@ -482,7 +482,7 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 - [x] P3-2：Pi AgentLoop 接入（ReAct 循环 + 工具白名单 + allowed repos/forbidden 约束）
   - 前置：P3-1
   - 验收：Agent 调用白名单外工具被拒并记审计；主模型无直接工作区访问路径
-- [ ] P3-3：预算强停（步数/Token/成本）
+- [x] P3-3：预算强停（步数/Token/成本）
   - 前置：P3-2
   - 验收：注入超限循环后任务被强停转 failed，trace 完整
 - [ ] P3-4：session 三层短期记忆（结构化任务状态/滚动窗口/早期摘要 + 触发规则）
