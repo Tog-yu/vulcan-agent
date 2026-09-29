@@ -24,10 +24,10 @@ function setup() {
 describe("P2-4 meegle 对账兜底", () => {
 	it("删除已投递事件后对账补齐：uuid 不在本地 → 补偿进队列", async () => {
 		const { db, enqueue } = setup();
-		// 本地已有事件 A，但工单 B 的 webhook 丢了
+		// 本地已有工单1的事件（键 = 对账派生键），工单2的 webhook 丢了
 		db.prepare(
-			"INSERT INTO webhook_events (id, source, type, occurred_at, ref, payload, raw, received_at, status) VALUES (?, 'meegle', 'workitem.updated', 0, '1', '{}', '{}', 0, 'done')",
-		).run("evt-A");
+			"INSERT INTO webhook_events (id, source, type, occurred_at, ref, payload, raw, received_at, status) VALUES (?, 'meegle', 'workitem.reconciled', 0, '1', '{}', '{}', 0, 'done')",
+		).run(`reconcile:1:${NOW - 1000}`);
 		const r = new MeegleReconciler({
 			db,
 			client: fakeClient([
