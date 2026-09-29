@@ -8,6 +8,21 @@ gateway:
 meegle:
   baseUrl: https://meegle.com
 
+db:
+  path: data/vulcan.db
+
+agent:
+  maxSteps: 50
+  tokenBudget: 160000
+  costUsdBudget: 5
+
+session:
+  summaryEverySteps: 15
+  summaryAtBudgetPct: 60
+
+retry:
+  maxAttempts: 3
+
 # 环境变量清单：
 #   VULCAN_WEBHOOK_SECRET_ALERT      告警 webhook HMAC 密钥
 #   VULCAN_WEBHOOK_SECRET_MEEGLE     meegle webhook HMAC 密钥
