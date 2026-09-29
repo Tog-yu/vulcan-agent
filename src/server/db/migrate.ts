@@ -162,6 +162,58 @@ ALTER TABLE webhook_events DROP COLUMN attempts;`,
 	MIGRATIONS.push({ version: 5, name: "append-only-approvals", up, down });
 }
 
+/**
+ * v6：approvals 主键改复合 (id, decided_by)（P2-8 修复）。
+ *
+ * 业务语义：一个审批单允许多条裁决记录 —— system 判 manual 一条 + 人工终态一条。
+ * 原 id 单列主键导致人工回调追加裁决行时 UNIQUE 冲突。
+ * SQLite 不能改主键 → 建新表搬数据再改名；注意 DROP TABLE 会连带删掉 v5 的
+ * append-only 触发器，重建表后必须补建。
+ */
+{
+	const triggers = appendOnlyTriggers("approvals");
+	MIGRATIONS.push({
+		version: 6,
+		name: "approvals-composite-pk",
+		up: `
+CREATE TABLE approvals_new (
+  id TEXT NOT NULL,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  decision TEXT NOT NULL CHECK (decision IN ('approved','rejected','manual')),
+  evidence_snapshot TEXT NOT NULL,
+  matched_rules TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  decided_by TEXT NOT NULL,
+  decided_at INTEGER NOT NULL,
+  PRIMARY KEY (id, decided_by)
+);
+INSERT INTO approvals_new (id, task_id, decision, evidence_snapshot, matched_rules, reason, decided_by, decided_at)
+  SELECT id, task_id, decision, evidence_snapshot, matched_rules, reason, decided_by, decided_at FROM approvals;
+DROP TABLE approvals;
+ALTER TABLE approvals_new RENAME TO approvals;
+${triggers.up};`,
+		down: `
+${triggers.down}
+CREATE TABLE approvals_old (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  decision TEXT NOT NULL CHECK (decision IN ('approved','rejected','manual')),
+  evidence_snapshot TEXT NOT NULL,
+  matched_rules TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  decided_by TEXT NOT NULL,
+  decided_at INTEGER NOT NULL
+);
+-- 复合主键回退为单列：同 id 多行时按 decided_at 取最新一条（SQLite bare column 语义）
+INSERT INTO approvals_old (id, task_id, decision, evidence_snapshot, matched_rules, reason, decided_by, decided_at)
+  SELECT id, task_id, decision, evidence_snapshot, matched_rules, reason, decided_by, decided_at
+  FROM approvals GROUP BY id HAVING decided_at = MAX(decided_at);
+DROP TABLE approvals;
+ALTER TABLE approvals_old RENAME TO approvals;
+${triggers.up};`,
+	});
+}
+
 export function openDb(dbPath: string): DatabaseSync {
 	return new DatabaseSync(dbPath);
 }
