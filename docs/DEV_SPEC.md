@@ -68,12 +68,12 @@
 | Lint / Format | Biome 2.3.5 | 是 | 单工具替代 eslint+prettier，devDependencies 固定 | `package.json:17` |
 | 测试 | vitest 4.1.9 | 是 | devDependencies 固定；ESM/TS 原生支持 | `package.json:22` |
 | Web 框架 | 无（node:http 内置） | 是 | gateway 骨架零第三方依赖；HTTP 层只需路由+鉴权+读体，不引框架 | `src/server/gateway/index.ts` |
-| Agent 底座 | Pi Agent Runtime（`@earendil-works/pi-*`） | 待核（2026-09-28） | 方案定默认 Pi；具体包名与版本未锁定，接入时登记进本表 | README「技术栈」、`src/server/agent/index.ts` |
-| 持久化 | SQLite（驱动：待核（2026-09-28），候选 node:sqlite 内置） | — | 单实例、内网部署，SQLite 足够；PG 仅作后续扩展点（见 §16） | `docs/PLAN-TRACKING.md` §五 |
-| 观测 | Langfuse（SDK 版本：待核（2026-09-28）） | — | 方案 9.2 指定；span 按 OpenTelemetry GenAI 语义约定携带 `gen_ai.*` 属性 | 《技术方案》9.2 |
+| Agent 底座 | Pi Agent Runtime（`@earendil-works/pi-agent-core@0.87.1` + `@earendil-works/pi-ai@0.87.1`） | 是 | 已接入 `src/server/agent/index.ts`：`runAgentLoop` 经动态 `import()` 惰性加载（静态导入会在 WorkBuddy 沙箱 shim 下触发 typebox 模块图 ~70-90s 求值，见 vitest.config.ts 注释）；生产模型流 = pi-ai `builtinModels()` + `models.streamSimple` | README「技术栈」、`src/server/agent/index.ts`、`src/server/cli/entry.ts` |
+| 持久化 | SQLite（驱动：`node:sqlite` 内置 `DatabaseSync`） | 是 | 已接入 `src/server/db/migrate.ts`；零第三方依赖；PG 仅作后续扩展点（见 §16） | `docs/PLAN-TRACKING.md` §五 |
+| 观测 | Langfuse（`langfuse@3.39.2`） | 是 | 已接入 `src/server/observability/trace.ts`（LangfuseSink）；span 按 OpenTelemetry GenAI 语义约定携带 `gen_ai.*` 属性 | 《技术方案》9.2 |
 | 通知 | 飞书自建机器人 webhook | — | 方案 8.3 指定卡片消息 | `config/config.yaml:17` |
 
-数据库与迁移：SQLite 单文件（路径进 §9 配置）；迁移工具与 down 脚本格式：待核（2026-09-28）（接入持久化时登记）；破坏性变更必须先出迁移说明再合码。
+数据库与迁移：SQLite 单文件（路径进 §9 配置）；迁移工具：自研迷你迁移器（`migrateUp`，`schema_migrations` 版本表 + 顺序执行，已接入 `src/server/db/migrate.ts`，当前 v1–v7）；破坏性变更必须先出迁移说明再合码。
 
 ## 4. 架构
 
@@ -148,7 +148,7 @@ stateDiagram-v2
 
 流转由 harness 的确定性流转表实现（见 §10），非法流转一律拒绝并告警。
 
-存储选型与迁移：SQLite 默认（理由见 §3）；核心表 `webhook_events`（幂等去重键=事件 ID 唯一索引）、`tasks`、`task_events`（append-only，含 `parent_event_id` 支持分支回放，沿用 fiat_agent 已验证的 event store 设计）、`sessions`、`approvals`、`memories`、`audit_logs`（append-only，触发器禁 UPDATE/DELETE）。迁移工具：待核（2026-09-28）。
+存储选型与迁移：SQLite 默认（理由见 §3）；核心表 `webhook_events`（幂等去重键=事件 ID 唯一索引）、`tasks`、`task_events`（append-only，含 `parent_event_id` 支持分支回放，沿用 fiat_agent 已验证的 event store 设计）、`sessions`、`approvals`、`memories`、`audit_logs`（append-only，触发器禁 UPDATE/DELETE）。迁移工具：自研迷你迁移器（版本表 + 顺序执行，已落地）。
 
 数据保留与合规：短期记忆随任务结束归档为过程记录，不自动成为后续任务上下文（《技术方案》5.2）；长期记忆准入与失效见 §6 memory 模块卡；webhook 原始 payload 快照与归档保留期：待核（2026-09-28）（涉及代码内容外发合规，与 Langfuse 留存策略一并定）；审计记录永久保留、不可修改；密钥/凭证/令牌不入任何表（《技术方案》6.3 排除清单）。
 
