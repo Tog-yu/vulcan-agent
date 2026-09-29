@@ -500,13 +500,13 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 
 #### 阶段 4：记忆与观测（P4）
 
-- [ ] P4-1：memory 写入门禁（四类准入 + verification_status 校验）
+- [x] P4-1：memory 写入门禁（四类准入 + verification_status 校验）
   - 前置：P3-7
   - 验收：未验证猜测被拦截；verified_by_test 记录带 source/code_version 入库
-- [ ] P4-2：memory 召回（按权限+相关性，限条数与总长度）与失效（stale 复核/冲突裁定）
+- [x] P4-2：memory 召回（按权限+相关性，限条数与总长度）与失效（stale 复核/冲突裁定）
   - 前置：P4-1
   - 验收：召回结果注入不超预算占比；冲突记忆按 verification_status 裁定而非时间
-- [ ] P4-3：任务定稿离线提炼（含失败任务提炼）
+- [x] P4-3：任务定稿离线提炼（含失败任务提炼）
   - 前置：P4-1
   - 验收：失败任务产生"有证据的失败经验"记录且来源任务可追溯
 - [ ] P4-4：Langfuse trace 接入（gen_ai.* 语义约定）

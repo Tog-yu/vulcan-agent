@@ -214,6 +214,18 @@ ${triggers.up};`,
 	});
 }
 
+/**
+ * v7：memories 加失效状态列（P4-2）。
+ * stale_status: active / stale_candidate（待复核：代码版本变更或超期无引用）/ retired（复核后下线）。
+ * 冲突裁定不改内容，只动 stale_status——保持原始记忆可追溯。
+ */
+MIGRATIONS.push({
+	version: 7,
+	name: "memories-stale-status",
+	up: "ALTER TABLE memories ADD COLUMN stale_status TEXT NOT NULL DEFAULT 'active';",
+	down: "ALTER TABLE memories DROP COLUMN stale_status;",
+});
+
 export function openDb(dbPath: string): DatabaseSync {
 	return new DatabaseSync(dbPath);
 }
