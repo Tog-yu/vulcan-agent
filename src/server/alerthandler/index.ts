@@ -1,52 +1,90 @@
 /**
- * 告警处理（技术方案 · 7.1）
+ * 告警处理（DEV_SPEC §14 P2-1/P2-2，技术方案 7.1）。
  *
- * 链路：去重降噪（同 group 合并/抑制）→ 分级 → 匹配责任团队与仓库 → 关联/建 meegle 工单 → 触发修复链路。
- * 安全口径：生产级 / 高风险告警默认只给分析建议，需人工确认，不直接进自动修复。
+ * 职责边界：
+ *   - 去重降噪：同 group（service + 标题特征）在抑制窗口内合并，只保留首条
+ *   - 分级：severity（critical/high/medium/low）+ 责任团队与仓库匹配（路由表）
+ *   - 自动修复白名单：命中的服务+级别直接进修复链路；白名单外只产出分析建议并回写
+ *
+ * 确定性边界：分级/合并/白名单判定全部是规则代码，不经过模型。
  */
 
-import type { InternalEvent } from "../types.ts";
+import type { InternalEvent, AlertSeverity } from "../types.ts";
 
-export interface AlertHandlerDeps {
-	/** 允许无人值守自动修复的服务白名单（按服务名），未命中只出分析建议 */
-	autoFixWhitelist: Set<string>;
+export interface AlertRouting {
+	/** 告警标签/服务名 → 责任团队 */
+	team: string;
+	/** 责任团队 → 默认代码仓库 */
+	repo: string;
 }
 
-export interface AlertOutcome {
-	action: "auto_fix" | "advise_only" | "merged";
-	reason: string;
+export interface RoutingTable {
+	/** 匹配规则按序生效：labels 匹配 service（精确）→ 团队+仓库 */
+	entries: Array<{ service: string; team: string; repo: string }>;
+	/** 兜底：未匹配时 */
+	defaultTeam: string;
+	defaultRepo: string;
+}
+
+export interface AlertDecision {
+	groupKey: string;
+	severity: AlertSeverity;
+	team: string;
+	repo: string;
+	/** true = 白名单命中，走自动修复；false = 只出分析建议 */
+	autofix: boolean;
+	/** true = 命中抑制窗口，本条被合并（不新建任务） */
+	suppressed: boolean;
+}
+
+export interface AlertHandlerDeps {
+	/** 自动修复白名单：service → 允许自动修复的最高 severity（含） */
+	autofixAllowlist: Record<string, AlertSeverity[]>;
+	/** 同 group 抑制窗口 ms，默认 5 分钟 */
+	suppressWindowMs?: number;
+	routing: RoutingTable;
+}
+
+const SEVERITY_ORDER: Record<AlertSeverity, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+/** group key：同服务+同标题视为同组（方案 7.1「同 group 告警合并」） */
+export function groupKeyOf(event: InternalEvent): string {
+	const svc = String(event.payload.service ?? "unknown");
+	const title = String(event.payload.title ?? "unknown");
+	return `${svc}::${title}`;
 }
 
 export class AlertHandler {
-	readonly #deps: AlertHandlerDeps;
-	/** 同 fingerprint 的活跃告警，用于合并抑制 */
-	readonly #active = new Map<string, number>();
+	/** groupKey → 上次放行时间 ms（进程内降噪窗口；跨重启以 DB 任务是否存在为准） */
+	private readonly lastFired = new Map<string, number>();
+	private readonly deps: AlertHandlerDeps;
 
 	constructor(deps: AlertHandlerDeps) {
-		this.#deps = deps;
+		this.deps = deps;
 	}
 
-	handle(event: InternalEvent): AlertOutcome {
-		const fp = String(event.payload.fingerprint ?? event.ref);
-		const severity = String(event.payload.severity ?? "medium");
+	route(event: InternalEvent): AlertDecision {
 		const service = String(event.payload.service ?? "unknown");
+		const severity = (event.payload.severity as AlertSeverity) ?? "low";
+		const groupKey = groupKeyOf(event);
 
-		// 去重降噪：窗口内同 fingerprint 合并
-		const lastSeen = this.#active.get(fp);
+		// 去重降噪：抑制窗口内的同组告警合并
 		const now = Date.now();
-		if (lastSeen && now - lastSeen < 60_000) {
-			this.#active.set(fp, now);
-			return { action: "merged", reason: "60s 窗口内重复告警，已合并" };
-		}
-		this.#active.set(fp, now);
+		const last = this.lastFired.get(groupKey);
+		const window = this.deps.suppressWindowMs ?? 5 * 60_000;
+		const suppressed = last !== undefined && now - last < window;
+		if (!suppressed) this.lastFired.set(groupKey, now);
 
-		// 自动修复白名单：未命中只给建议（生产 / 高风险默认人工确认）
-		if (severity === "critical" || severity === "high" || !this.#deps.autoFixWhitelist.has(service)) {
-			return {
-				action: "advise_only",
-				reason: `服务 ${service} 不在自动修复白名单或级别为 ${severity}，仅输出分析建议`,
-			};
-		}
-		return { action: "auto_fix", reason: "命中白名单，触发修复链路" };
+		// 责任团队与仓库匹配（精确 service 匹配 → 兜底）
+		const entry = this.deps.routing.entries.find((e) => e.service === service);
+		const team = entry?.team ?? this.deps.routing.defaultTeam;
+		const repo = entry?.repo ?? this.deps.routing.defaultRepo;
+
+		// 自动修复白名单：severity 必须达到该服务允许清单中某一级（更严重或同级）
+		const allowed = this.deps.autofixAllowlist[service];
+		const autofix =
+			Array.isArray(allowed) && allowed.some((s) => SEVERITY_ORDER[severity] <= SEVERITY_ORDER[s]);
+
+		return { groupKey, severity, team, repo, autofix, suppressed };
 	}
 }
