@@ -47,10 +47,14 @@ export interface LangfuseSinkOptions {
  */
 export class LangfuseSink implements TraceSink {
 	private readonly enabled: boolean;
+	private readonly opts: LangfuseSinkOptions;
+	private readonly delegate: TraceSink;
 	// SDK 实例在首次 createTrace 时动态加载（避免模块级 import 的网络/密钥副作用）
 	private clientPromise: Promise<unknown> | null = null;
 
-	constructor(private readonly opts: LangfuseSinkOptions, private readonly delegate: TraceSink = new NullSink()) {
+	constructor(opts: LangfuseSinkOptions, delegate: TraceSink = new NullSink()) {
+		this.opts = opts;
+		this.delegate = delegate;
 		this.enabled = Boolean(opts.publicKey && opts.secretKey);
 	}
 

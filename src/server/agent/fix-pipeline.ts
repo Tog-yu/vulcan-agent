@@ -75,7 +75,11 @@ function extractEvidence(run: AgentRunOutput): { patchRef: string; changedFiles:
 }
 
 export class FixPipeline {
-	constructor(private readonly deps: FixPipelineDeps) {}
+	private readonly deps: FixPipelineDeps;
+
+	constructor(deps: FixPipelineDeps) {
+		this.deps = deps;
+	}
 
 	async run(input: FixRunInput): Promise<FixRunOutput> {
 		const { db, agent, scope, tools } = this.deps;

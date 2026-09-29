@@ -46,7 +46,11 @@ export type DenyReason =
 	| "empty-content";
 
 export class MemoryGate {
-	constructor(private readonly db: DatabaseSync) {}
+	private readonly db: DatabaseSync;
+
+	constructor(db: DatabaseSync) {
+		this.db = db;
+	}
 
 	/** 单条准入校验 + 入库；拒绝时返回理由（不抛错——拒绝是正常路径） */
 	admit(cand: MemoryCandidate): AdmitResult {
