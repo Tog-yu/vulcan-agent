@@ -1,105 +1,167 @@
-import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/server/config/index.ts";
-import { normalizeAlert, normalizeApproval, normalizeMeegle } from "../src/server/gateway/normalize.ts";
-import { EventQueue } from "../src/server/gateway/queue.ts";
-import { GatewayServer, hmacSign, hmacVerify } from "../src/server/gateway/server.ts";
+import { describe, expect, it, afterEach } from "vitest";
+import { createGateway, startGateway, type GatewayDeps, type EventSink } from "../src/server/gateway/index.ts";
+import { signPayload } from "../src/server/gateway/verify.ts";
+import type { InternalEvent } from "../src/server/types.ts";
+import type { VulcanConfig } from "../src/server/config/index.ts";
+import type { Server } from "node:http";
 
-const SECRET = "test-secret";
-const config = loadConfig();
-const deps = {
-	config,
-	secretOf: () => SECRET,
-	queue: new EventQueue(),
-};
+function makeConfig(overrides: Partial<VulcanConfig["gateway"]> = {}): VulcanConfig {
+	return {
+		gateway: { host: "127.0.0.1", port: 0, maxBodyBytes: 1024, ...overrides },
+		meegle: { baseUrl: "https://meegle.com" },
+		db: { path: ":memory:" },
+		agent: { maxSteps: 50, tokenBudget: 160000, costUsdBudget: 5 },
+		session: { summaryEverySteps: 15, summaryAtBudgetPct: 60 },
+		retry: { maxAttempts: 3 },
+		secrets: {
+			webhookSecretAlert: "sk-alert",
+			webhookSecretMeegle: "sk-meegle",
+			webhookSecretApproval: "sk-approval",
+			meeglePluginToken: "pt",
+			meegleUserKey: "uk",
+			larkWebhook: null,
+		},
+	};
+}
 
-function makeRequest(method: string, path: string, body?: string, headers: Record<string, string> = {}) {
-	const req = new Request(`http://localhost${path}`, {
-		method,
+function makeSink(seen: InternalEvent[] = []): EventSink & { seenIds: () => string[] } {
+	const ids = new Set<string>();
+	return {
+		async tryEnqueue(event: InternalEvent) {
+			if (ids.has(event.id)) return false;
+			ids.add(event.id);
+			seen.push(event);
+			return true;
+		},
+		seenIds: () => [...ids],
+	};
+}
+
+function makeDeps(overrides: Partial<GatewayDeps> = {}): GatewayDeps & { sink: ReturnType<typeof makeSink> } {
+	const sink = makeSink();
+	return {
+		config: makeConfig(),
+		secrets: {
+			getSecret: (s) =>
+				({ alert: "sk-alert", meegle: "sk-meegle", approval: "sk-approval" })[s],
+		},
+		sink,
+		...overrides,
+	} as GatewayDeps & { sink: ReturnType<typeof makeSink> };
+}
+
+async function post(server: Server, path: string, body: string, headers: Record<string, string> = {}): Promise<{ status: number; json: Record<string, unknown> }> {
+	const res = await fetch(`http://127.0.0.1:${(server.address() as { port: number }).port}${path}`, {
+		method: "POST",
+		body,
 		headers,
-		body: body ?? (method === "POST" ? "{}" : undefined),
 	});
-	return { req: req as unknown as import("node:http").IncomingMessage, res: new MockResponse() };
+	return { status: res.status, json: (await res.json()) as Record<string, unknown> };
 }
 
-class MockResponse {
-	statusCode = 0;
-	body = "";
-	writeHead(status: number, _headers: Record<string, string>) {
-		this.statusCode = status;
-	}
-	end(data?: string) {
-		this.body = data ?? "";
-	}
+function signedHeaders(source: "alert" | "meegle" | "approval", body: string): Record<string, string> {
+	const secret = { alert: "sk-alert", meegle: "sk-meegle", approval: "sk-approval" }[source];
+	return { "x-vulcan-signature": signPayload(source, Buffer.from(body, "utf8"), secret), "content-type": "application/json" };
 }
 
-describe("hmac 鉴权", () => {
-	it("正确签名通过，错误签名拒绝", () => {
-		const body = '{"a":1}';
-		expect(hmacVerify(SECRET, body, hmacSign(SECRET, body))).toBe(true);
-		expect(hmacVerify(SECRET, body, "bad")).toBe(false);
-		expect(hmacVerify(SECRET, body, undefined)).toBe(false);
+let server: Server | null = null;
+let deps: ReturnType<typeof makeDeps> | null = null;
+
+async function start(depsOverride: Partial<GatewayDeps> = {}): Promise<ReturnType<typeof makeDeps>> {
+	deps = makeDeps(depsOverride);
+	server = createGateway(deps);
+	await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+	return deps;
+}
+
+afterEach(() => {
+	server?.close();
+	server = null;
+	deps = null;
+});
+
+describe("gateway HTTP", () => {
+	it("非 /webhook/ 路径或非 POST → 404", async () => {
+		await start();
+		expect((await post(server!, "/other", "{}", signedHeaders("alert", "{}"))).status).toBe(404);
+		expect((await fetch(`http://127.0.0.1:${(server!.address() as { port: number }).port}/webhook/alert`)).status).toBe(404);
+	});
+
+	it("未知 source → 404", async () => {
+		await start();
+		expect((await post(server!, "/webhook/github", "{}", signedHeaders("alert", "{}"))).status).toBe(404);
+	});
+
+	it("缺签名头 → 401；错误签名 → 403", async () => {
+		await start();
+		const body = JSON.stringify({ fingerprint: "f1" });
+		expect((await post(server!, "/webhook/alert", body, {})).status).toBe(401);
+		expect((await post(server!, "/webhook/alert", body, { "x-vulcan-signature": "deadbeef" })).status).toBe(403);
+	});
+
+	it("query string 传 token → 403（PLAN-TRACKING 硬约束 2）", async () => {
+		await start();
+		const body = JSON.stringify({ fingerprint: "f1" });
+		const res = await post(server!, "/webhook/alert?token=abc", body, signedHeaders("alert", body));
+		expect(res.status).toBe(403);
+	});
+
+	it("超 maxBodyBytes → 413", async () => {
+		await start({ config: makeConfig({ maxBodyBytes: 16 }) });
+		const big = JSON.stringify({ fingerprint: "x".repeat(64) });
+		const res = await post(server!, "/webhook/alert", big, signedHeaders("alert", big));
+		expect(res.status).toBe(413);
+	});
+
+	it("非法 JSON → 400", async () => {
+		await start();
+		const bad = "{not json";
+		expect((await post(server!, "/webhook/alert", bad, signedHeaders("alert", bad))).status).toBe(400);
+	});
+
+	it("startGateway 非 loopback host 拒绝启动（DEV_SPEC §9 fail-fast）", async () => {
+		const d = makeDeps();
+		d.config.gateway.host = "0.0.0.0";
+		await expect(startGateway(d)).rejects.toThrow(/loopback/);
 	});
 });
 
-describe("normalize 归一化", () => {
-	it("meegle payload 提取 header.uuid 与 event_type", () => {
-		const ev = normalizeMeegle({ header: { event_type: "workitem.created", uuid: "u-1" }, payload: { id: 123 } });
-		expect(ev.id).toBe("meegle:u-1");
-		expect(ev.type).toBe("workitem.created");
-		expect(ev.ref).toBe("123");
+describe("幂等与归一化", () => {
+	it("同事件重复投递：首次 2xx 入库、二次 2xx dedup 且不重复入库", async () => {
+		const d = await start();
+		const body = JSON.stringify({ fingerprint: "fp-1", severity: "high" });
+		const first = await post(server!, "/webhook/alert", body, signedHeaders("alert", body));
+		const second = await post(server!, "/webhook/alert", body, signedHeaders("alert", body));
+		expect(first.status).toBe(200);
+		expect(second.status).toBe(200);
+		expect(second.json.dedup).toBe(true);
+		expect(d.sink.seenIds().filter((id) => id === "fp-1").length).toBe(1);
 	});
 
-	it("approval payload 提取 ticket_id", () => {
-		const ev = normalizeApproval({ ticket_id: "T-9" });
-		expect(ev.source).toBe("approval");
-		expect(ev.ref).toBe("T-9");
-	});
-
-	it("alert payload 提取 severity 并容错", () => {
-		const ev = normalizeAlert({
-			alerts: [{ fingerprint: "fp1", labels: { alertname: "HighCPU", severity: "critical", service: "api" } }],
+	it("meegle：header.uuid 为幂等键，payload 段进入 event.payload", async () => {
+		const d = await start();
+		const body = JSON.stringify({
+			header: { event_type: "workitem.created", uuid: "u-123" },
+			payload: { id: 42, name: "修复登录失败", updated_at: 1727500000000 },
 		});
-		expect(ev.payload.severity).toBe("critical");
-		expect(ev.ref).toBe("fp1");
-	});
-});
-
-describe("幂等去重", () => {
-	it("同 ID 第二次入队返回 false", () => {
-		const q = new EventQueue();
-		const ev = normalizeApproval({ ticket_id: "T-1" });
-		expect(q.enqueue(ev)).toBe(true);
-		expect(q.enqueue(ev)).toBe(false);
-		expect(q.stats().duplicates).toBe(1);
-	});
-});
-
-describe("GatewayServer.handleRequest", () => {
-	it("healthz 返回 200", async () => {
-		const gs = new GatewayServer(deps);
-		const { req, res } = makeRequest("GET", "/healthz");
-		await gs.handleRequest(req, res as never);
-		expect(res.statusCode).toBe(200);
+		const res = await post(server!, "/webhook/meegle", body, signedHeaders("meegle", body));
+		expect(res.status).toBe(200);
+		const seen = d.sink.seenIds();
+		expect(seen).toContain("u-123");
 	});
 
-	it("无签名 → 401；有效签名 → 200 且事件入队；重复投递 → duplicate", async () => {
-		const queue = new EventQueue();
-		const gs = new GatewayServer({ ...deps, queue });
-		const body = JSON.stringify({ ticket_id: "T-42" });
-		const sig = hmacSign(SECRET, body);
+	it("meegle 缺 header 段 → 422 显式拒绝", async () => {
+		await start();
+		const body = JSON.stringify({ payload: { id: 42 } });
+		const res = await post(server!, "/webhook/meegle", body, signedHeaders("meegle", body));
+		expect(res.status).toBe(422);
+	});
 
-		const { req: r1, res: res1 } = makeRequest("POST", "/webhook/approval", body);
-		await gs.handleRequest(r1, res1 as never);
-		expect(res1.statusCode).toBe(401);
-
-		const { req: r2, res: res2 } = makeRequest("POST", "/webhook/approval", body, { "x-vulcan-signature": sig });
-		await gs.handleRequest(r2, res2 as never);
-		expect(res2.statusCode).toBe(200);
-		expect(JSON.parse(res2.body).status).toBe("accepted");
-		expect(queue.stats().enqueued).toBe(1);
-
-		const { req: r3, res: res3 } = makeRequest("POST", "/webhook/approval", body, { "x-vulcan-signature": sig });
-		await gs.handleRequest(r3, res3 as never);
-		expect(JSON.parse(res3.body).status).toBe("duplicate");
+	it("approval：ticketId 为幂等键", async () => {
+		const d = await start();
+		const body = JSON.stringify({ ticketId: "AP-7", decision: "approved" });
+		const res = await post(server!, "/webhook/approval", body, signedHeaders("approval", body));
+		expect(res.status).toBe(200);
+		expect(d.sink.seenIds()).toContain("AP-7");
 	});
 });
