@@ -7,12 +7,13 @@
  * 案例数据集 = 历史 Bug 清单（事件 + 问题 + 预期结果），
  * 案例执行器由调用方注入（生产 = FixPipeline 适配器；测试 = mock runner）。
  * MemoryStore 由调用方注入并共享——评测模式开关对它直接生效。
+ * 记忆按 project 分区隔离（RAG），评测对象即 project。
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { EvalMode } from "./eval-mode.ts";
-import { MemoryStore } from "../memory/index.ts";
+import type { MemoryStore } from "../memory/index.ts";
 import { attributionDistribution, type FailureCategory } from "./attribution.ts";
+import { EvalMode } from "./eval-mode.ts";
 
 export interface EvalCase {
 	/** 案例号（历史 Bug 的唯一标识） */
@@ -47,18 +48,21 @@ export interface EvalReport {
 }
 
 export class EvalRunner {
-	private readonly em: EvalMode;
+	readonly #em: EvalMode;
+	readonly #db: DatabaseSync;
 
-	constructor(
-		private readonly db: DatabaseSync,
-		private readonly store: MemoryStore,
-	) {
-		this.em = new EvalMode(db, store);
+	constructor(db: DatabaseSync, store: MemoryStore, project: string) {
+		this.#db = db;
+		this.#em = new EvalMode(db, store, project);
 	}
 
-	async run(cases: EvalCase[], runner: CaseRunner, opts: { resetMemories?: boolean; actor?: string } = {}): Promise<EvalReport> {
-		this.em.enable({ reset: opts.resetMemories, actor: opts.actor });
-		const baseline = this.em.validateBaseline();
+	async run(
+		cases: EvalCase[],
+		runner: CaseRunner,
+		opts: { resetMemories?: boolean; actor?: string } = {},
+	): Promise<EvalReport> {
+		await this.#em.enable({ reset: opts.resetMemories, actor: opts.actor });
+		const baseline = await this.#em.validateBaseline();
 
 		const detail: Array<{ caseId: string; outcome: CaseOutcome }> = [];
 		try {
@@ -67,7 +71,7 @@ export class EvalRunner {
 			}
 		} finally {
 			// 跑批异常也必须退出评测模式，否则线上召回被永久关闭
-			this.em.disable(opts.actor ?? "evaluator");
+			await this.#em.disable(opts.actor ?? "evaluator");
 		}
 
 		const success = detail.filter((d) => d.outcome === "pr_created").length;
@@ -78,7 +82,7 @@ export class EvalRunner {
 			totalCases: cases.length,
 			successRate: cases.length > 0 ? success / cases.length : 0,
 			manualInterventionRate: cases.length > 0 ? manual / cases.length : 0,
-			attribution: attributionDistribution(this.db),
+			attribution: attributionDistribution(this.#db),
 			cases: detail,
 		};
 	}

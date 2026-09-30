@@ -5,7 +5,7 @@ import { createGvfsRetrievalPlugin, fnv1a, type GvfsClient, type RemoteCandidate
 import { gvfsMetricsSnapshot } from "../src/server/observability/gvfs-metrics.ts";
 import { EvalRunner, type CaseRunner, type EvalCase } from "../src/server/observability/eval-runner.ts";
 import { MemoryStore } from "../src/server/memory/index.ts";
-import { MemoryGate } from "../src/server/memory/gate.ts";
+import { FakeRagServer } from "./helpers/fake-rag-server.ts";
 
 // ---------- P5-1 GVFS 三层检索 ----------
 
@@ -130,10 +130,11 @@ describe("P5-3 历史 Bug 对照数据集评测跑批", () => {
 		const db = new DatabaseSync(":memory:");
 		migrateUp(db);
 		// 预置一条活跃记忆（若评测模式失效它会被召回 → 开卷）
-		new MemoryGate(db).admit({
+		const fake = new FakeRagServer();
+		const store = new MemoryStore({ rag: { transport: "stdio" }, clientFactory: fake.factory() });
+		await store.admit({
 			content: "历史记忆：token 问题直接改 cache", category: "verified_fix", source: "task:x", project: "svc/auth", verificationStatus: "verified_by_test",
 		});
-		const store = new MemoryStore(db);
 		// 预置一条失败任务 + 审计（归因分布数据源）
 		db.prepare("INSERT INTO tasks (id, source, ref, status, created_at, updated_at) VALUES ('t-f', 'alert', 'fp-003', 'failed', 0, 0)").run();
 		db.prepare(
@@ -143,36 +144,39 @@ describe("P5-3 历史 Bug 对照数据集评测跑批", () => {
 		const runner: CaseRunner = {
 			async run(c) {
 				// runner 运行期间召回必须是关闭的（防开卷）
-				if (store.recall({ project: "svc/auth" }).length > 0) throw new Error("评测模式失效：runner 内仍能召回记忆（开卷）");
+				if ((await store.recall({ project: "svc/auth" })).length > 0) throw new Error("评测模式失效：runner 内仍能召回记忆（开卷）");
 				return c.caseId === "bug-001" ? "pr_created" : c.caseId === "bug-002" ? "manual_review" : "failed";
 			},
 		};
-		const report = await new EvalRunner(db, store).run(cases, runner);
+		const report = await new EvalRunner(db, store, "svc/auth").run(cases, runner);
 		expect(report.baselineOk).toBe(true);
 		expect(report.successRate).toBeCloseTo(1 / 3);
 		expect(report.manualInterventionRate).toBeCloseTo(1 / 3);
 		expect(report.attribution.permission_violation).toBe(1); // t-f 命中 tool_blocked
 		expect(report.cases).toHaveLength(3);
 		// 跑完评测模式自动关闭 → 召回恢复
-		expect(store.recall({ project: "svc/auth" }).length).toBe(1);
+		expect((await store.recall({ project: "svc/auth" })).length).toBe(1);
+		await store.close();
 	});
 
 	it("reset 跑批：先清空长期记忆再起跑（干净基线），跑完评测模式自动关闭", async () => {
 		const db = new DatabaseSync(":memory:");
 		migrateUp(db);
-		new MemoryGate(db).admit({
+		const fake = new FakeRagServer();
+		const store = new MemoryStore({ rag: { transport: "stdio" }, clientFactory: fake.factory() });
+		await store.admit({
 			content: "旧记忆", category: "constraint_decision", source: "task:x", project: "svc/auth", verificationStatus: "verified_by_test",
 		});
-		const store = new MemoryStore(db);
 		let memoryCountDuringRun = -1;
-		const report = await new EvalRunner(db, store).run(cases, {
+		const report = await new EvalRunner(db, store, "svc/auth").run(cases, {
 			async run() {
-				memoryCountDuringRun = store.recall({ project: "svc/auth" }).length;
+				memoryCountDuringRun = (await store.recall({ project: "svc/auth" })).length;
 				return "pr_created";
 			},
 		}, { resetMemories: true });
 		expect(report.baselineOk).toBe(true);
 		expect(memoryCountDuringRun).toBe(0); // reset 后跑批中无记忆可召回
-		expect(store.recall({ project: "svc/auth" })).toHaveLength(0); // 清空是持久的
+		expect(await store.recall({ project: "svc/auth" })).toHaveLength(0); // 清空是持久的
+		await store.close();
 	});
 });

@@ -8,7 +8,7 @@ import { collectMetrics } from "../src/server/observability/metrics.ts";
 import { attributeFailure, attributionDistribution } from "../src/server/observability/attribution.ts";
 import { EvalMode } from "../src/server/observability/eval-mode.ts";
 import { MemoryStore } from "../src/server/memory/index.ts";
-import { MemoryGate } from "../src/server/memory/gate.ts";
+import { FakeRagServer } from "./helpers/fake-rag-server.ts";
 import { LangfuseSink, NullSink, agentTraceAdapter, genAiAttributes, type TraceSink, type TraceSpan } from "../src/server/observability/trace.ts";
 import type { ToolPlugin, ToolResult } from "../src/server/cordis/index.ts";
 
@@ -166,35 +166,39 @@ describe("P4-5 指标采集与失败归因", () => {
 // ---------- P4-6 评测模式 ----------
 
 describe("P4-6 评测模式开关", () => {
-	it("recall_off：召回关闭（不开卷），记忆保留；disable 恢复", () => {
+	it("recall_off：召回关闭（不开卷），记忆保留；disable 恢复", async () => {
 		const db = seedDb();
-		new MemoryGate(db).admit({
+		const fake = new FakeRagServer();
+		const store = new MemoryStore({ rag: { transport: "stdio" }, clientFactory: fake.factory() });
+		await store.admit({
 			content: "约束 A", category: "constraint_decision", source: "task:t-1", project: "svc/auth", verificationStatus: "verified_by_test",
 		});
-		const store = new MemoryStore(db);
-		const em = new EvalMode(db, store);
-		em.enable();
-		expect(em.validateBaseline()).toMatchObject({ ok: true });
-		expect(store.recall({ project: "svc/auth" })).toHaveLength(0); // 召回关闭
-		expect(em.status().memoryCount).toBe(1); // 记忆还在
-		em.disable();
-		expect(store.recall({ project: "svc/auth" })).toHaveLength(1); // 恢复
+		const em = new EvalMode(db, store, "svc/auth");
+		await em.enable();
+		expect(await em.validateBaseline()).toMatchObject({ ok: true });
+		expect(await store.recall({ project: "svc/auth" })).toHaveLength(0); // 召回关闭
+		expect((await em.status()).memoryCount).toBe(1); // 记忆还在
+		await em.disable();
+		expect(await store.recall({ project: "svc/auth" })).toHaveLength(1); // 恢复
+		await store.close();
 	});
 
-	it("reset：清空记忆 + 基线校验（残留则拒绝起跑）", () => {
+	it("reset：清空记忆 + 基线校验（残留则拒绝起跑）", async () => {
 		const db = seedDb();
-		new MemoryGate(db).admit({
+		const fake = new FakeRagServer();
+		const store = new MemoryStore({ rag: { transport: "stdio" }, clientFactory: fake.factory() });
+		await store.admit({
 			content: "约束 B", category: "constraint_decision", source: "task:t-1", project: "svc/auth", verificationStatus: "verified_by_test",
 		});
-		const store = new MemoryStore(db);
-		const em = new EvalMode(db, store);
+		const em = new EvalMode(db, store, "svc/auth");
 		// 未开启 → 基线校验拒绝
-		expect(em.validateBaseline().ok).toBe(false);
-		em.enable({ reset: true });
-		expect(em.status()).toMatchObject({ active: true, mode: "reset", memoryCount: 0 });
-		expect(em.validateBaseline()).toMatchObject({ ok: true });
+		expect((await em.validateBaseline()).ok).toBe(false);
+		await em.enable({ reset: true });
+		expect(await em.status()).toMatchObject({ active: true, mode: "reset", memoryCount: 0 });
+		expect(await em.validateBaseline()).toMatchObject({ ok: true });
 		// 开关动作落审计（可追溯）
 		const evalAudit = db.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE object_type = 'eval'").get() as { c: number };
 		expect(evalAudit.c).toBeGreaterThanOrEqual(1);
+		await store.close();
 	});
 });

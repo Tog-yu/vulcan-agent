@@ -15,7 +15,7 @@ describe("migrateUp", () => {
 		expect(second).toEqual([]);
 	});
 
-	it("建齐 7 张核心表 + schema_migrations", () => {
+	it("建齐 6 张核心表 + schema_migrations；记忆已迁 RAG（memories 表不存在）", () => {
 		const db = freshDb();
 		migrateUp(db);
 		const tables = db
@@ -28,12 +28,13 @@ describe("migrateUp", () => {
 			"task_events",
 			"sessions",
 			"approvals",
-			"memories",
 			"audit_logs",
 			"schema_migrations",
 		]) {
 			expect(tables).toContain(t);
 		}
+		// 存储后端切换为 RAG 后，本地不再有 memories 表（完全替换）
+		expect(tables).not.toContain("memories");
 	});
 
 	it("webhook_events.id 重复插入被主键拒绝（幂等去重键）", () => {

@@ -98,21 +98,6 @@ CREATE TABLE IF NOT EXISTS approvals (
   decided_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memories (
-  id TEXT PRIMARY KEY,
-  content TEXT NOT NULL,
-  category TEXT NOT NULL CHECK (category IN (
-    'constraint_decision','verified_fix','failure_lesson','user_preference')),
-  source TEXT NOT NULL,                -- 来源任务/工单/commit/文档
-  project TEXT NOT NULL,
-  code_version TEXT,
-  verification_status TEXT NOT NULL CHECK (verification_status IN (
-    'verified_by_test','verified_by_human','observed','unverified')),
-  expires_at INTEGER,
-  created_at INTEGER NOT NULL,
-  last_referenced_at INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL,                 -- 谁
@@ -126,7 +111,6 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 `,
 		down: `
 DROP TABLE IF EXISTS audit_logs;
-DROP TABLE IF EXISTS memories;
 DROP TABLE IF EXISTS approvals;
 DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS task_events;
@@ -215,16 +199,11 @@ ${triggers.up};`,
 }
 
 /**
- * v7：memories 加失效状态列（P4-2）。
- * stale_status: active / stale_candidate（待复核：代码版本变更或超期无引用）/ retired（复核后下线）。
- * 冲突裁定不改内容，只动 stale_status——保持原始记忆可追溯。
+ * v7（已废弃）：memories 表的 stale_status 迁移。
+ * 存储后端切换为 RAG（DEV_SPEC §14 P4，技术方案 6.x）后，记忆不再存本地
+ * SQLite —— memories 表已从 v1 移除，本迁移随之移除。失效生命周期由
+ * RAG memory_manage（mark_stale / resolve）承担。
  */
-MIGRATIONS.push({
-	version: 7,
-	name: "memories-stale-status",
-	up: "ALTER TABLE memories ADD COLUMN stale_status TEXT NOT NULL DEFAULT 'active';",
-	down: "ALTER TABLE memories DROP COLUMN stale_status;",
-});
 
 export function openDb(dbPath: string): DatabaseSync {
 	return new DatabaseSync(dbPath);

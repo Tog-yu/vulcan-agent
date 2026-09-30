@@ -15,6 +15,7 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "^0.87.1",
+		"@modelcontextprotocol/sdk": "^1.30.0",
 		"langfuse": "^3.39.2"
 	},
 	"devDependencies": {
