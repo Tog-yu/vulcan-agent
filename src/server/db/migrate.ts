@@ -205,6 +205,29 @@ ${triggers.up};`,
  * RAG memory_manage（mark_stale / resolve）承担。
  */
 
+/**
+ * v7：sessions 表补 v2 记忆系统所需的元数据列。
+ *
+ * 对照 Claude Code 记忆体系重构后新增：
+ *   compact_meta    压缩流水线动作计数 + 熔断状态（可观测、可恢复）
+ *   file_state      文件访问台账（readFileState），压缩/恢复后复读最新内容
+ *   session_memory  Session Memory 结构化笔记（9 段模板，磁盘文件的可查副本）
+ *
+ * 三列都可空：v1 数据升级后旧行保持 NULL，读取侧按骨架兜底。
+ */
+MIGRATIONS.push({
+	version: 7,
+	name: "sessions-v2-compact-columns",
+	up: `
+ALTER TABLE sessions ADD COLUMN compact_meta TEXT;
+ALTER TABLE sessions ADD COLUMN file_state TEXT;
+ALTER TABLE sessions ADD COLUMN session_memory TEXT;`,
+	down: `
+ALTER TABLE sessions DROP COLUMN compact_meta;
+ALTER TABLE sessions DROP COLUMN file_state;
+ALTER TABLE sessions DROP COLUMN session_memory;`,
+});
+
 export function openDb(dbPath: string): DatabaseSync {
 	return new DatabaseSync(dbPath);
 }

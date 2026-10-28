@@ -8,9 +8,8 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import type { InternalEvent } from "../types.ts";
-import { transitionTask, canTransition, IllegalTransitionError } from "./state-machine.ts";
-import type { TaskStatus } from "../types.ts";
+import type { InternalEvent, TaskStatus } from "../types.ts";
+import { canTransition, IllegalTransitionError, transitionTask } from "./state-machine.ts";
 
 export type RouteHandler = (event: InternalEvent, taskId: string) => Promise<void>;
 
@@ -39,9 +38,7 @@ export class Harness {
 		const id = `task-${event.source}-${event.ref}-${Date.now()}`;
 		const now = Date.now();
 		this.deps.db
-			.prepare(
-				"INSERT INTO tasks (id, source, ref, status, created_at, updated_at) VALUES (?, ?, ?, 'received', ?, ?)",
-			)
+			.prepare("INSERT INTO tasks (id, source, ref, status, created_at, updated_at) VALUES (?, ?, ?, 'received', ?, ?)")
 			.run(id, event.source, event.ref, now, now);
 		return { taskId: id, created: true };
 	}

@@ -18,21 +18,24 @@
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { loadConfig, ConfigError, type VulcanConfig } from "../config/index.ts";
-import { openDb, migrateUp } from "../db/migrate.ts";
-import { startGateway, type EventSink } from "../gateway/index.ts";
+import { FixPipeline } from "../agent/fix-pipeline.ts";
+import { type AgentRunDeps, VulcanAgentLoop } from "../agent/index.ts";
+import { AlertHandler } from "../alerthandler/index.ts";
+import { writeApprovalAudit } from "../approval/audit.ts";
+import { ApprovalFlow } from "../approval/flow.ts";
+import { ConfigError, loadConfig, type VulcanConfig } from "../config/index.ts";
+import { type CordisRuntime, createCordisRuntime } from "../cordis/bootstrap.ts";
+import { createBuiltinToolPlugins } from "../cordis/builtin-tools.ts";
+import type { PluginContext, ToolPlugin } from "../cordis/index.ts";
+import { migrateUp, openDb } from "../db/migrate.ts";
+import { type EventSink, startGateway } from "../gateway/index.ts";
 import { EventQueue } from "../gateway/queue.ts";
 import { Harness } from "../harness/index.ts";
 import { transitionTask } from "../harness/state-machine.ts";
-import { AlertHandler } from "../alerthandler/index.ts";
-import { ApprovalFlow } from "../approval/flow.ts";
-import { writeApprovalAudit } from "../approval/audit.ts";
 import { Notifier, ownerChainOf } from "../notify/index.ts";
-import { VulcanAgentLoop, type AgentRunDeps } from "../agent/index.ts";
-import { FixPipeline } from "../agent/fix-pipeline.ts";
-import type { InternalEvent } from "../types.ts";
-import type { ToolPlugin } from "../cordis/index.ts";
 import { agentTraceAdapter, LangfuseSink, NullSink } from "../observability/trace.ts";
+import { FileSessionStorage } from "../session/transcript.ts";
+import type { InternalEvent } from "../types.ts";
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -48,7 +51,7 @@ function parseSimpleYaml(text: string): Record<string, Record<string, string | n
 	let current: Record<string, string | number> | null = null;
 	for (const line of text.split("\n")) {
 		if (!line.trim() || line.trim().startsWith("#")) continue;
-		const nested = line.match(/^  (\w[\w-]*):\s*(.*?)\s*(?:#.*)?$/);
+		const nested = line.match(/^ {2}(\w[\w-]*):\s*(.*?)\s*(?:#.*)?$/);
 		if (nested && current) {
 			const [, k, rawV] = nested;
 			const v = /^-?\d+(\.\d+)?$/.test(rawV) ? Number(rawV) : rawV.replace(/^["']|["']$/g, "");
@@ -83,7 +86,11 @@ function lazyPipelineAssembly(): Promise<PipelineDeps> {
 		log("info", "生产模型已装配", { provider, model: modelId });
 		// models.streamSimple 绑定 Models 实例（含凭据解析），签名与 AgentRunDeps.streamFn 对齐
 		const streamFn = ((m: never, context: unknown, options?: unknown) =>
-			(models as unknown as { streamSimple: (m: never, c: unknown, o?: unknown) => unknown }).streamSimple(m, context, options)) as never;
+			(models as unknown as { streamSimple: (m: never, c: unknown, o?: unknown) => unknown }).streamSimple(
+				m,
+				context,
+				options,
+			)) as never;
 		return { streamFn, model: model as never };
 	})();
 	return pipelineAssembly;
@@ -129,15 +136,33 @@ async function main(): Promise<void> {
 	//    agent.run() 内部才被调用（见下），启动路径不创建任何 pi-ai 的 Promise
 	const traceSink = process.env.VULCAN_LANGFUSE_PUBLIC_KEY
 		? new LangfuseSink({
-			publicKey: process.env.VULCAN_LANGFUSE_PUBLIC_KEY,
-			secretKey: process.env.VULCAN_LANGFUSE_SECRET_KEY ?? "",
-			baseUrl: process.env.VULCAN_LANGFUSE_BASE_URL,
-		})
+				publicKey: process.env.VULCAN_LANGFUSE_PUBLIC_KEY,
+				secretKey: process.env.VULCAN_LANGFUSE_SECRET_KEY ?? "",
+				baseUrl: process.env.VULCAN_LANGFUSE_BASE_URL,
+			})
 		: new NullSink();
 	log("info", "观测 sink", { kind: traceSink instanceof LangfuseSink ? "langfuse" : "null（未配置密钥，显式降级）" });
 
-	const agent: VulcanAgentLoop = {
-		async run(input: Parameters<VulcanAgentLoop["run"]>[0]) {
+	// Cordis 执行层（真·cordis v4，参考 DSH）：能力层 Service（tools/retrieval/agent）
+	// + 功能层插件（内置读/改/测）。setup 抛错 → fail-fast，拒绝带病启动。
+	const cordisPluginCtx: PluginContext = {
+		log: (msg, extra) => log("info", msg, extra),
+		workspaceRoot: process.cwd(),
+		allowedRepos: [], // 项目清单由部署配置填充（对齐 FixPipeline scope 的现状）
+	};
+	let cordis: CordisRuntime;
+	try {
+		cordis = await createCordisRuntime(createBuiltinToolPlugins(cordisPluginCtx), cordisPluginCtx);
+	} catch (err) {
+		log("error", `Cordis 执行层装配失败，拒绝启动：${(err as Error).message}`);
+		db.close();
+		process.exit(1);
+	}
+	log("info", "Cordis 执行层已装配", { tools: cordis.tools.list().map((t) => t.tool) });
+
+	// Agent 执行能力注册为 cordis 服务（ctx.agent）——依赖注入替代直接 import。
+	cordis.agent.bind({
+		async run(input) {
 			// 首个修复任务时才装配模型（~17s 一次，之后单例复用）
 			const { streamFn, model } = await lazyPipelineAssembly();
 			const deps: AgentRunDeps = {
@@ -152,11 +177,8 @@ async function main(): Promise<void> {
 			};
 			return new VulcanAgentLoop(deps).run(input);
 		},
-	} as VulcanAgentLoop;
-
-	// 工具插件集（生产实现：本地工作区读改 + 测试执行 + 受控 PR；scope 由任务路由决定）
-	const tools: ToolPlugin[] = [];
-	void tools; // 工具注册表由部署环境按项目配置填充（cordis registry 装配点）
+	});
+	const agent = cordis.agent;
 
 	// PR 创建出口（生产 = GitHub API；此处落审计后由部署环境注入具体实现）
 	const createPr = async (input: { taskId: string; branch: string; title: string; patchRef: string }) => {
@@ -164,10 +186,22 @@ async function main(): Promise<void> {
 		return { url: `https://git.example/${input.branch}/pull/${input.taskId}` };
 	};
 
-	const fixPipeline = new FixPipeline({ db, agent, scope: { allowedRepos: [], forbiddenPaths: [] }, tools, createPr });
+	const fixPipeline = new FixPipeline({
+		db,
+		agent: agent as unknown as VulcanAgentLoop, // AgentService 门面与 VulcanAgentLoop.run 签形一致
+		scope: { allowedRepos: [], forbiddenPaths: [] },
+		tools: cordis.tools.list(),
+		retrieval: cordis.retrieval.get() ?? undefined,
+		createPr,
+		// 会话账本 + artifact 外置 + Session Memory：落 data/ 下（与 DB 同盘）
+		sessionStorage: new FileSessionStorage(process.env.VULCAN_DATA_DIR ?? "data"),
+	});
 
 	// 5. 通知（飞书密钥缺失 = 显式降级，不阻断）
-	const notifier = new Notifier({ larkWebhook: config.secrets.larkWebhook, onWarn: (msg, extra) => log("warn", msg, extra) });
+	const notifier = new Notifier({
+		larkWebhook: config.secrets.larkWebhook,
+		onWarn: (msg, extra) => log("warn", msg, extra),
+	});
 
 	// 6. 审批人工回调（approvals 复合主键行由 system 裁决时写入，人工结论追加 decided_by 行）
 	const approvalFlow = new ApprovalFlow({ db, onWarn: (msg, extra) => log("warn", msg, extra) });
@@ -193,7 +227,14 @@ async function main(): Promise<void> {
 					return;
 				}
 				transitionTask(db, taskId, "triaged", "running");
-				const out = await fixPipeline.run({ taskId, event, issue: String(event.payload.title ?? event.ref), impactScope: decision.repo });
+				const out = await fixPipeline.run({
+					taskId,
+					event,
+					issue: String(event.payload.title ?? event.ref),
+					impactScope: decision.repo,
+					// 观测挂接：agentTraceAdapter 的 onEvent 事件经 harness ctx 透传进来
+					onEvent: (event as { onEvent?: (evt: unknown) => void }).onEvent,
+				});
 				if (out.outcome === "manual_review") {
 					// 转人工 → 飞书卡片走责任人阶梯（工单 owner → 代码 owner → 团队 lead → 值班）
 					const delivered = await notifier.sendManualReviewCard(decision.team, {
@@ -202,7 +243,9 @@ async function main(): Promise<void> {
 						intent: out.reason ?? "人工审批",
 						diffSummary: out.verdict?.matchedAllowUnmet.join("; ") ?? "",
 						impactScope: decision.repo,
-						evidenceSummary: out.verdict ? `deny=[${out.verdict.matchedDeny}] unmet=[${out.verdict.matchedAllowUnmet}]` : "",
+						evidenceSummary: out.verdict
+							? `deny=[${out.verdict.matchedDeny}] unmet=[${out.verdict.matchedAllowUnmet}]`
+							: "",
 					});
 					if (!delivered) log("warn", "人工审批卡片未送达（飞书禁用或失败）", { taskId });
 				}
@@ -235,13 +278,14 @@ async function main(): Promise<void> {
 	const server = await startGateway({ config, secrets, sink, onLog: log });
 	log("info", "gateway 已启动", { host: config.gateway.host, port: config.gateway.port });
 
-	// 9. 消费循环：事件入队 → harness.handleEvent（trace adapter 挂在 agent.onEvent 由 FixPipeline 传递）
+	// 9. 消费循环：事件入队 → harness.handleEvent
+	//    trace 链路：每事件生成 traceId + adapter，挂到事件对象上透传给 FixPipeline（§14 P4-4）
 	let running = true;
 	const consumer = queue.run(
 		async (event) => {
 			const traceId = `trace-${event.id}`;
 			const onEvent = agentTraceAdapter(traceId, traceSink, String(process.env.VULCAN_MODEL_ID ?? "gpt-4o"));
-			void onEvent; // FixPipeline.run 的 onEvent 出口在部署装配时接入（当前 trace 由 agent 层 audit 覆盖）
+			(event as { onEvent?: unknown }).onEvent = onEvent;
 			await harness.handleEvent(event);
 		},
 		() => running,
@@ -255,7 +299,7 @@ async function main(): Promise<void> {
 		exiting = true;
 		log("info", `收到 ${signal}，开始优雅退出`);
 		running = false;
-		Promise.allSettled([consumer, new Promise<void>((r) => server.close(() => r()))]).then(() => {
+		Promise.allSettled([consumer, new Promise<void>((r) => server.close(() => r())), cordis.dispose()]).then(() => {
 			db.close();
 			log("info", "已退出：队列无残留 processing 状态");
 			process.exit(0);

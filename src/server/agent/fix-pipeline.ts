@@ -12,13 +12,14 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { VulcanAgentLoop, applyBudgetOutcome, type AgentRunDeps, type AgentRunOutput } from "../agent/index.ts";
-import { ApprovalEngine, type Adjudication } from "../approval/engine.ts";
+import type { AgentEvent } from "@earendil-works/pi-agent-core";
+import { type AgentRunDeps, type AgentRunOutput, applyBudgetOutcome, type VulcanAgentLoop } from "../agent/index.ts";
 import { writeApprovalAudit } from "../approval/audit.ts";
+import { type Adjudication, ApprovalEngine } from "../approval/engine.ts";
+import type { RetrievalPlugin, ToolPlugin, ToolScope } from "../cordis/index.ts";
 import { transitionTask } from "../harness/state-machine.ts";
-import { SessionManager, type SessionMessage } from "../session/index.ts";
+import { SessionManager, type SessionMessage, defaultSummarize, type SessionStorage } from "../session/index.ts";
 import type { ApprovalRequest, InternalEvent } from "../types.ts";
-import type { ToolPlugin, ToolScope, RetrievalPlugin } from "../cordis/index.ts";
 
 export interface FixPipelineDeps {
 	db: DatabaseSync;
@@ -33,6 +34,13 @@ export interface FixPipelineDeps {
 	createPr: (input: { taskId: string; branch: string; title: string; patchRef: string }) => Promise<{ url: string }>;
 	/** 审批策略引擎（缺省用默认规则） */
 	engine?: ApprovalEngine;
+	/**
+	 * 会话落盘层（Transcript JSONL + artifact 外置 + Session Memory）。
+	 * 缺省 = 只写 SQLite 快照（测试/无状态运行）；生产由 entry.ts 注入 FileSessionStorage。
+	 */
+	sessionStorage?: SessionStorage;
+	/** 摘要器（缺省 = compact.ts 的确定性零 LLM 实现；生产可换成主模型调用） */
+	summarize?: (earlySummary: string | null, evicted: SessionMessage[]) => string;
 }
 
 export interface FixRunInput {
@@ -42,6 +50,11 @@ export interface FixRunInput {
 	/** 审批输入的其他要素（调用方从任务上下文组装） */
 	applicant?: string;
 	impactScope?: string;
+	/**
+	 * Agent 事件出口（观测挂接点）：调用方传入 agentTraceAdapter，
+	 * FixPipeline 在自身 session 挂接之外转发全部事件（trace 不再断链）。
+	 */
+	onEvent?: (event: AgentEvent) => void;
 }
 
 export interface FixRunOutput {
@@ -52,7 +65,9 @@ export interface FixRunOutput {
 }
 
 /** 从 AgentRunOutput 提取补丁引用与证据（工具插件约定输出形状） */
-function extractEvidence(run: AgentRunOutput): { patchRef: string; changedFiles: string[]; testsPassed: boolean; buildPassed: boolean } | null {
+function extractEvidence(
+	run: AgentRunOutput,
+): { patchRef: string; changedFiles: string[]; testsPassed: boolean; buildPassed: boolean } | null {
 	const toolResults = run.messages.filter((m) => (m as { role: string }).role === "toolResult") as unknown as Array<{
 		content: Array<{ type: string; text?: string }>;
 	}>;
@@ -84,8 +99,10 @@ export class FixPipeline {
 	async run(input: FixRunInput): Promise<FixRunOutput> {
 		const { db, agent, scope, tools } = this.deps;
 		const session = new SessionManager(db, input.taskId, {
-			summarize: (early, evicted) => `${early ?? ""}此前执行过 ${evicted.length} 步（结论已合并）`,
+			// 缺省用确定性零 LLM 摘要器（v1 是朴素拼接，v2 升级为 9 段结构化）
+			summarize: this.deps.summarize ?? defaultSummarize,
 			budgetTokens: 200_000,
+			storage: this.deps.sessionStorage,
 		});
 
 		// —— 执行层（8.1 步骤 3）：AgentLoop 四阶段 ReAct ——
@@ -96,6 +113,16 @@ export class FixPipeline {
 		].join("\n");
 		const prompt = `告警事件：${input.event.ref}\n问题：${input.issue}`;
 
+		// 任务目标进权威层 + 用户消息进账本（不进滚动窗口——窗口只装工具证据）
+		const initialState = session.getTaskState();
+		if (!initialState.objective.issue) {
+			session.setTaskState({
+				...initialState,
+				objective: { ...initialState.objective, issue: input.issue, ticket_id: input.event.ref },
+			});
+		}
+		session.recordOnly({ role: "user", content: prompt, timestamp: Date.now() });
+
 		let run: AgentRunOutput;
 		try {
 			run = await agent.run({
@@ -104,6 +131,17 @@ export class FixPipeline {
 				tools,
 				scope,
 				onEvent: (evt) => {
+					// 每轮模型调用的用量单独上报：v1 只在工具结果时传 usage，
+					// 没有工具调用的轮次 token 不上报 → token 触发长期失效
+					if (evt.type === "turn_end") {
+						const usage = (evt.message as { usage?: { input?: number } }).usage;
+						session.noteUsage(usage?.input ?? 0);
+						const text = (evt.message as { content?: Array<{ type: string; text?: string }> }).content
+							?.filter((c) => c.type === "text" && c.text)
+							.map((c) => c.text)
+							.join("\n");
+						if (text) session.recordOnly({ role: "assistant", content: text, timestamp: Date.now() });
+					}
 					// toolResult 进 session 滚动窗口（三层短期记忆挂接）
 					if (evt.type === "tool_execution_end") {
 						const msg: SessionMessage = {
@@ -114,6 +152,8 @@ export class FixPipeline {
 						};
 						session.append(msg);
 					}
+					// 观测出口：转发给调用方的 trace adapter（Langfuse 链路）
+					input.onEvent?.(evt);
 				},
 			});
 		} catch (err) {

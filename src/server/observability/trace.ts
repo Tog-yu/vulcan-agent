@@ -59,24 +59,84 @@ export class LangfuseSink implements TraceSink {
 	}
 
 	createTrace(traceId: string, name: string, attributes?: Record<string, string | number | boolean>): void {
-		if (this.enabled) void this.ensureClient();
 		this.delegate.createTrace(traceId, name, attributes);
+		if (!this.enabled) return;
+		void this.ensureClient().then((client) => {
+			if (!client) return;
+			(client as { trace: (o: Record<string, unknown>) => unknown }).trace({
+				id: traceId,
+				name,
+				metadata: attributes ?? {},
+			});
+		});
 	}
 
 	addSpan(span: TraceSpan): void {
 		this.delegate.addSpan(span);
+		if (!this.enabled) return;
+		void this.ensureClient().then((client) => {
+			if (!client) return;
+			const lf = client as {
+				trace: (o: Record<string, unknown>) => {
+					span: (o: Record<string, unknown>) => { end: (o?: Record<string, unknown>) => void };
+				};
+			};
+			lf.trace({ id: span.traceId, name: "vulcan.task" })
+				.span({
+					id: spanIdOf(span.traceId, span.name, span.startTime),
+					name: span.name,
+					startTime: new Date(span.startTime),
+					endTime: span.endTime ? new Date(span.endTime) : undefined,
+					metadata: span.attributes ?? {},
+					statusMessage: span.status ?? "ok",
+				})
+				.end();
+		});
 	}
 
 	endTrace(traceId: string, attributes?: Record<string, string | number | boolean>): void {
 		this.delegate.endTrace(traceId, attributes);
+		if (!this.enabled) return;
+		void this.ensureClient().then((client) => {
+			if (!client) return;
+			// endTrace 追加一条收尾 span（trace 本体在 createTrace 已建，Langfuse 无 endTrace 概念）
+			const lf = client as {
+				trace: (o: Record<string, unknown>) => {
+					span: (o: Record<string, unknown>) => { end: (o?: Record<string, unknown>) => void };
+				};
+			};
+			lf.trace({ id: traceId, name: "vulcan.task" })
+				.span({ name: "vulcan.trace.end", metadata: attributes ?? {} })
+				.end();
+		});
+	}
+
+	/** 等待 SDK 客户端就绪并 flush（供脚本退出前调用，防止异步批量上报丢失） */
+	async flush(): Promise<void> {
+		const client = await this.ensureClient();
+		if (!client) return;
+		const flushable = client as { flushAsync?: () => Promise<void> };
+		if (flushable.flushAsync) await flushable.flushAsync();
 	}
 
 	private ensureClient(): Promise<unknown> {
 		this.clientPromise ??= import("langfuse")
-			.then((mod) => new mod.Langfuse({ publicKey: this.opts.publicKey, secretKey: this.opts.secretKey, baseUrl: this.opts.baseUrl }))
+			.then(
+				(mod) =>
+					new mod.Langfuse({
+						publicKey: this.opts.publicKey,
+						secretKey: this.opts.secretKey,
+						baseUrl: this.opts.baseUrl,
+					}),
+			)
 			.catch(() => null); // SDK 加载失败 → 保持 no-op，不抛
 		return this.clientPromise;
 	}
+}
+
+/** Langfuse span id 需稳定且唯一：由 traceId + span 名 + 起始时间派生（同参重放同 id，幂等） */
+function spanIdOf(traceId: string, name: string, startTime: number): string {
+	return `${traceId}-${name}-${Math.floor(startTime / 1000)}`.slice(0, 200);
 }
 
 // ---------- gen_ai.* 语义约定属性 ----------
@@ -114,13 +174,25 @@ export function agentTraceAdapter(traceId: string, sink: TraceSink, model: strin
 				turnStart = Date.now();
 				break;
 			case "turn_end": {
-				const msg = event.message as { role: string; usage?: UsageShape; stopReason?: string };
+				const msg = event.message as {
+					role: string;
+					usage?: UsageShape;
+					stopReason?: string;
+					errorMessage?: string;
+				};
 				const attrs: Record<string, string | number | boolean> = {
 					...genAiAttributes(model, msg.usage ?? { input: 0, output: 0 }),
 					"vulcan.turn.stop_reason": msg.stopReason ?? "unknown",
 				};
+				if (msg.errorMessage) attrs["vulcan.turn.error"] = msg.errorMessage;
 				if (turnStart) attrs["vulcan.turn.duration_ms"] = Date.now() - turnStart;
-				sink.addSpan({ traceId, name: "gen_ai.turn", startTime: turnStart || Date.now(), endTime: Date.now(), attributes: attrs });
+				sink.addSpan({
+					traceId,
+					name: "gen_ai.turn",
+					startTime: turnStart || Date.now(),
+					endTime: Date.now(),
+					attributes: attrs,
+				});
 				break;
 			}
 			case "tool_execution_start":

@@ -1,6 +1,7 @@
 # Vulcan Agent（火哨）开发者规格说明（DEV_SPEC）
 
-> 版本：0.1.0 · 状态：草稿 · 版本核对日期：2026-09-28
+> 版本：0.3.0 · 状态：草稿 · 版本核对日期：2026-09-30
+> 变更记录：0.3.0 —— 长期记忆迁移 RAG 存储（§3/§5/§6/§9/§14 任务清单 P4-7/术语表；v1–v6，memories 表移除）；0.2.0 —— Cordis 执行层接入（§3/§6）。
 > 适用范围：vulcan-agent 后端（`src/server/`），面向企业研发场景的告警处置 Agent 平台
 > 事实来源：本仓库源码（`src/`、`config/`、`package.json`）+ 《技术方案 - Vulcan 火哨》（Obsidian：`AI 学习/20-Agent 架构与开发/27-Vulcan 火哨 Agent/`）
 
@@ -32,7 +33,7 @@
 明确排除项（它不是什么）：
 
 1. 不是通用编码助手 / IDE 插件——不与 Claude Code 类工具竞争通用场景。
-2. 不重造 Agent 运行时——Agent 循环复用 Pi，Cordis 只做装配与插件管理，本身不做模型推理。
+2. 不重造 Agent 运行时——Agent 循环复用 Pi；Cordis（真·cordis v4 框架，见 §3/§6）只做装配与插件管理，本身不做模型推理。
 3. 不做多租户 SaaS——单企业内部部署，按项目配置隔离，不做租户体系。
 4. 不做自动合并主干——一切对外写操作（创建 PR、回写工单）经审批裁决，生产级告警默认只出建议。
 
@@ -71,9 +72,13 @@
 | Agent 底座 | Pi Agent Runtime（`@earendil-works/pi-agent-core@0.87.1` + `@earendil-works/pi-ai@0.87.1`） | 是 | 已接入 `src/server/agent/index.ts`：`runAgentLoop` 经动态 `import()` 惰性加载（静态导入会在 WorkBuddy 沙箱 shim 下触发 typebox 模块图 ~70-90s 求值，见 vitest.config.ts 注释）；生产模型流 = pi-ai `builtinModels()` + `models.streamSimple` | README「技术栈」、`src/server/agent/index.ts`、`src/server/cli/entry.ts` |
 | 持久化 | SQLite（驱动：`node:sqlite` 内置 `DatabaseSync`） | 是 | 已接入 `src/server/db/migrate.ts`；零第三方依赖；PG 仅作后续扩展点（见 §16） | `docs/PLAN-TRACKING.md` §五 |
 | 观测 | Langfuse（`langfuse@3.39.2`） | 是 | 已接入 `src/server/observability/trace.ts`（LangfuseSink）；span 按 OpenTelemetry GenAI 语义约定携带 `gen_ai.*` 属性 | 《技术方案》9.2 |
+| 长期记忆存储 | RAG 服务托管：MODULAR-RAG-MCP-SERVER（MCP 客户端 `@modelcontextprotocol/sdk@^1.30.0`） | — | 混合检索（向量+BM25）优于本地关键词召回；Hermes 横向结论（8 个记忆 provider 中 5 个为 RAG 型）；fiat-agent「存储桥」模式（双客户端/熔断/降级）已验证 | `src/server/memory/rag-bridge.ts`、`src/server/memory/rag-transport.ts`、`src/server/memory/circuit.ts` |
 | 通知 | 飞书自建机器人 webhook | — | 方案 8.3 指定卡片消息 | `config/config.yaml:17` |
+| 插件框架 | cordis v4（`cordis@4.0.0-rc.10` + `cosmokit`） | 否（rc 线，钉版本） | 真·Cordis 插件元框架（Koishi 生态同源，DSH vendored 的同一框架）；已接入执行层：能力做成 Service（ctx.tools/ctx.retrieval/ctx.agent），功能做成插件（`{name, inject, apply(ctx)}`，DSH 风格）；生命周期由 cordis fiber 托管 | `src/server/cordis/runtime.ts`、`src/server/cordis/bootstrap.ts` |
 
-数据库与迁移：SQLite 单文件（路径进 §9 配置）；迁移工具：自研迷你迁移器（`migrateUp`，`schema_migrations` 版本表 + 顺序执行，已接入 `src/server/db/migrate.ts`，当前 v1–v7）；破坏性变更必须先出迁移说明再合码。
+数据库与迁移：SQLite 单文件（路径进 §9 配置）；迁移工具：自研迷你迁移器（`migrateUp`，`schema_migrations` 版本表 + 顺序执行，已接入 `src/server/db/migrate.ts`，当前 v1–v6）；破坏性变更必须先出迁移说明再合码。
+
+长期记忆存储：**RAG 服务托管，不落本地库**——经 MCP 客户端（`@modelcontextprotocol/sdk@^1.30.0`）访问 MODULAR-RAG-MCP-SERVER 的 `memory_store` / `memory_search` / `memory_manage` 三个工具（管理面含 list / mark_stale / resolve / clear，分区受限）；Vulcan 侧按 project 独占分区 `repo/vulcan-<project>`（scope=repo）。选型依据：Hermes 8 个记忆 provider 中 5 个为 RAG 型（向量/BM25 混合检索）的横向结论 + fiat-agent 已验证的「存储桥」模式（双客户端、熔断、降级）；本地 SQLite 关键词召回已被完全替换（原 memories 表与 v7 stale_status 迁移已从 migrate.ts 移除，v7 语义由 RAG 侧 stale_status 字段承接）。
 
 ## 4. 架构
 
@@ -101,7 +106,7 @@ graph TD
 |---|---|---|
 | 接入层（gateway） | 统一入口 `/webhook/:source`：HMAC 签名校验、幂等去重、读体限长、payload 归一化为 InternalEvent、投递日志 | HTTP 层零业务逻辑；不感知具体告警/工单语义 |
 | 编排层（harness） | 事件消费、校验、权限、路由、任务状态机管理、预算强停、派发链路 | 不做模型推理；不直接执行工具 |
-| 执行层（cordis + agent） | 插件注册/装配/生命周期；AgentLoop 组织 ReAct 循环；检索与工具执行 | Cordis 不做模型推理；主模型不直接操作工作区，工具执行一律经工具插件 |
+| 执行层（cordis + agent） | 真·cordis v4 装配：能力层 Service（ToolService/RetrievalService/AgentService 挂 ctx.tools/ctx.retrieval/ctx.agent）+ 功能层插件（`{name, inject, apply}`）；插件 setup/dispose 生命周期由 cordis fiber 托管；AgentLoop 组织 ReAct 循环；检索与工具执行 | Cordis 不做模型推理；主模型不直接操作工作区，工具执行一律经工具插件 |
 | 支撑模块（alerthandler/meegle/approval/session/memory/notify） | 各自领域的业务规则（详见 §6 模块卡） | 不越过 harness 直接互相调用 |
 | 存储层 | SQLite 持久化与查询、schema 演进 | 不含业务规则 |
 | 能力网关（meegle client / 飞书 / 告警回写） | 收敛所有对外部系统的访问，统一鉴权、限流、重试 | 业务模块不得自行直连外部系统 |
@@ -122,7 +127,7 @@ graph TD
 | MeegleWorkItem | 工单（`src/server/types.ts:51-58`） | 关联 0..n 个 VulcanTask |
 | Session | 任务现场：结构化任务状态 + 近期对话原文 + 早期摘要三层（《技术方案》5.2） | 属于一个 VulcanTask |
 | ApprovalRecord | 审批裁决记录：输入证据/命中规则/三态结论/裁决人 | 属于一个 VulcanTask；对应 0..1 条 AuditLog |
-| MemoryRecord | 长期记忆：content + source/project/code_version/verification_status/expires_at（《技术方案》6.3） | 独立实体，按 project 召回进任务上下文 |
+| MemoryRecord | 长期记忆：text + kind（constraint_decision/verified_fix/failure_lesson/user_preference）+ source/project/code_version/verification_status/stale_status（《技术方案》6.3 + RAG schema v2） | **存于 RAG 服务分区**（`repo/vulcan-<project>`），不在本地 SQLite 建表；按 project 召回进任务上下文 |
 | AuditLog | 审计留痕：谁/何时/对什么/做了什么/结果（《技术方案》8.4） | append-only，不可修改 |
 
 状态机——VulcanTask（状态枚举对齐 `src/server/types.ts:84-92`）：
@@ -148,7 +153,7 @@ stateDiagram-v2
 
 流转由 harness 的确定性流转表实现（见 §10），非法流转一律拒绝并告警。
 
-存储选型与迁移：SQLite 默认（理由见 §3）；核心表 `webhook_events`（幂等去重键=事件 ID 唯一索引）、`tasks`、`task_events`（append-only，含 `parent_event_id` 支持分支回放，沿用 fiat_agent 已验证的 event store 设计）、`sessions`、`approvals`、`memories`、`audit_logs`（append-only，触发器禁 UPDATE/DELETE）。迁移工具：自研迷你迁移器（版本表 + 顺序执行，已落地）。
+存储选型与迁移：SQLite 默认（理由见 §3）；核心表 `webhook_events`（幂等去重键=事件 ID 唯一索引）、`tasks`、`task_events`（append-only，含 `parent_event_id` 支持分支回放，沿用 fiat_agent 已验证的 event store 设计）、`sessions`、`approvals`、`audit_logs`（append-only，触发器禁 UPDATE/DELETE）。**长期记忆不在本地建表**（原 `memories` 表已随 P4-7 迁移 RAG 移除）。迁移工具：自研迷你迁移器（版本表 + 顺序执行，已落地，当前 v1–v6）。
 
 数据保留与合规：短期记忆随任务结束归档为过程记录，不自动成为后续任务上下文（《技术方案》5.2）；长期记忆准入与失效见 §6 memory 模块卡；webhook 原始 payload 快照与归档保留期：待核（2026-09-28）（涉及代码内容外发合规，与 Langfuse 留存策略一并定）；审计记录永久保留、不可修改；密钥/凭证/令牌不入任何表（《技术方案》6.3 排除清单）。
 
@@ -167,11 +172,18 @@ vulcan-agent/
 │   ├── approval/               # 审批：策略引擎 / 三态裁决 / 人工上下文包 / 审计
 │   ├── alerthandler/           # 告警：去重降噪 / 分级 / 关联工单 / 回写
 │   ├── meegle/                 # 工单：Open API client（幂等/限流）/ 对账兜底
-│   ├── cordis/                 # 执行层：插件契约 / registry / 生命周期
+│   ├── cordis/                 # 执行层：真·cordis v4（Service + 插件装配）/ 旧自研 registry（保留）
+│   │   ├── index.ts            # VulcanPlugin/ToolPlugin/RetrievalPlugin 契约 + 旧 createRegistry
+│   │   ├── runtime.ts          # 能力层 Service：ToolService/RetrievalService/AgentService
+│   │   ├── bootstrap.ts        # createCordisRuntime：Context 装配 + 插件包装挂载
+│   │   ├── builtin-tools.ts    # 内置工具插件（read_file/write_file/run_tests）
+│   │   ├── retrieval.ts        # 检索插件（普通项目形态）
+│   │   └── gvfs.ts             # 检索插件（GVFS 大仓三层形态）
 │   ├── agent/                  # AgentLoop（默认 Pi）/ 工具白名单 / 预算强停
 │   ├── session/                # 会话：三层短期记忆 / 摘要触发 / 中断恢复
-│   ├── memory/                 # 长期记忆：写入门禁 / 召回 / 失效
+│   ├── memory/                 # 长期记忆：RAG 存储桥（双客户端/熔断）/ 写入门禁 / 召回 / 失效复核
 │   └── notify/                 # 通知：飞书卡片 / 责任人路由 / 超时升级
+├── src/types/cordis.d.ts       # cordis 类型兜底（npm cordis d.ts 在 Node16 解析下失败，见 §15）
 ├── web/                        # React 前端（当前不做，见 §16）
 └── test/                       # vitest
 ```
@@ -184,7 +196,7 @@ vulcan-agent/
 |---|---|---|
 | 模型 / LLM 接入 | 是 | Agent 循环与任务整理均依赖模型；默认 Pi 驱动，主模型可配 |
 | 检索增强（RAG） | 是 | 代码检索与长期记忆召回都走检索；大仓库走远端索引三层形态 |
-| 外部工具协议（MCP 类） | 否 | Vulcan 是 MCP 消费方而非提供方：检索能力经检索插件接口接入 MODULAR-RAG-MCP-SERVER，不对上层暴露 MCP 服务 |
+| 外部工具协议（MCP 类） | 否 | Vulcan 是 MCP 消费方而非提供方：检索能力经检索插件接口接入 MODULAR-RAG-MCP-SERVER，长期记忆经 MCP 客户端（`@modelcontextprotocol/sdk`）访问其 memory_store/search/manage 工具；不对上层暴露 MCP 服务 |
 | 多租户与数据隔离 | 否 | 单企业内部部署，按 project 字段隔离记忆与权限，不做租户体系 |
 | 审批流 | 是 | 创建 PR、回写工单是必须人工确认的写操作；审批是平台核心链路 |
 | 异步与事件 | 是 | Webhook 耗时任务必须异步队列 + 重试 + 死信 |
@@ -206,11 +218,11 @@ vulcan-agent/
 #### 检索增强（RAG，cordis 检索插件 + memory/）
 
 - 启用条件：任务定位需要代码上下文；长期记忆需要按相关性召回。
-- 职责：普通项目本地/服务端索引检索；300GB+ GVFS 大仓库走"远端共享索引+本地增量覆盖+按需读取"三层形态；本地覆盖以内容哈希为准，按需下载后必须核验版本（《技术方案》4.2 四项接口要求：权限在召回前过滤、结果携带 repo/branch/file_path/commit/content_hash、哈希对齐、版本核验告警）。
-- 输入 / 输出：输入=查询（自然语言/标识符）+权限范围；输出=带版本坐标的代码片段，超预算按条数与总长度截断。
-- 依赖（前置模块）：cordis 插件契约；外部系统=远端索引服务（大仓库形态）、MODULAR-RAG-MCP-SERVER（记忆召回）。
-- 失败路径与降级：外部不可用（索引服务不可达）→ 任务挂起在 `running` 并重试，超过阈值转人工；版本核验不一致→显式告警交 Agent 决策，禁止静默替换（《技术方案》4.2 第 4 条）。
-- 验收标准：模拟索引返回过期 commit，编辑前核验触发告警且不静默使用；本地修改文件以 content_hash 判定覆盖关系正确。
+- 职责：普通项目本地/服务端索引检索；300GB+ GVFS 大仓库走"远端共享索引+本地增量覆盖+按需读取"三层形态，本地覆盖以内容哈希为准，按需下载后必须核验版本（《技术方案》4.2 四项接口要求：权限在召回前过滤、结果携带 repo/branch/file_path/commit/content_hash、哈希对齐、版本核验告警）。**长期记忆半区**：`memory/` 经存储桥（`rag-bridge.ts`）把记忆生命周期映射到 MODULAR-RAG-MCP-SERVER 的 MCP 工具——准入→`memory_store`（带 verification_status/code_version 元数据）、召回→`memory_search`（混合检索，stale 条目服务端已过滤）、失效/复核/评测清空→`memory_manage`（mark_stale / resolve / clear，分区受限）；桥做双客户端隔离（写客户端为私有字段，会话只见只读 search 通道）、分区唯一注入、后置校验 fail-closed、降级与熔断（连续 5 次失败熔断 120s，期间召回为空、写入拒绝并告警）。
+- 输入 / 输出：输入=查询（自然语言/标识符）+权限范围；输出=带版本坐标的代码片段，超预算按条数与总长度截断；记忆召回带 kind/verification_status/stale_status 供冲突裁定。
+- 依赖（前置模块）：cordis 插件契约；外部系统=远端索引服务（大仓库形态）、MODULAR-RAG-MCP-SERVER（记忆存储/召回/管理面）。
+- 失败路径与降级：外部不可用（索引服务不可达）→ 任务挂起在 `running` 并重试，超过阈值转人工；RAG 记忆服务不可达 → 熔断降级（不阻塞主链路，任务在"无长期记忆"模式运行），恢复后半开探测；版本核验不一致→显式告警交 Agent 决策，禁止静默替换（《技术方案》4.2 第 4 条）。
+- 验收标准：模拟索引返回过期 commit，编辑前核验触发告警且不静默使用；本地修改文件以 content_hash 判定覆盖关系正确；模拟 RAG 不可达，召回为空/写入拒绝且熔断与恢复行为正确（`test/memory.test.ts`）。
 - 不启用时的行为：关闭后修复链路无代码上下文来源，任务只允许走"仅分析建议"模式；不静默退化为本地全仓扫描。
 
 #### 审批流（approval/）
@@ -256,11 +268,15 @@ vulcan-agent/
 #### 插件 / 扩展机制（cordis/）
 
 - 启用条件：需在不改动本体的前提下按项目替换检索与执行能力。
-- 职责：VulcanPlugin/ToolPlugin/RetrievalPlugin 契约、注册表、setup/dispose 生命周期、依赖注入装配。
-- 输入 / 输出：输入=插件实现；输出=装配完成的执行层实例。
-- 依赖（前置模块）：config（按项目选择插件）。
-- 失败路径与降级：外部不可用（插件 setup 抛错）→ 启动 fail-fast，拒绝带病启动；自身异常（运行期插件崩溃）→ AgentLoop 捕获记为工具失败，走任务失败/重试路径。
-- 验收标准：注册一个 mock 检索插件替换默认实现，任务全链路无感知完成，dispose 被调用一次。
+- 职责：基于真·cordis v4（Koishi 生态插件元框架，DeepSeek Harness 同款底座）的插件化执行层——
+  - 契约层（`cordis/index.ts`）：VulcanPlugin/ToolPlugin/RetrievalPlugin（name + setup(ctx)/dispose()，kind 区分 tool/retrieval）；
+  - 能力层（`cordis/runtime.ts`）：三个 Cordis Service——ToolService（ctx.tools，工具注册/查询，重名 fail-fast）、RetrievalService（ctx.retrieval，至多一条检索链路）、AgentService（ctx.agent，Agent 执行能力依赖注入）；
+  - 装配层（`cordis/bootstrap.ts`）：`createCordisRuntime(plugins, pluginCtx)` = new Context() → 挂 Service → 业务插件包装成 cordis 对象插件（`{name, inject, apply(ctx)}`，DSH 风格）逐个挂载；setup 抛错 → fail-fast 逆序回滚已挂载插件；dispose 经 `ctx.effect()` 托管给 fiber，`ctx.fiber.dispose()` 逆序回收；
+  - 旧自研注册表（`cordis/index.ts` createRegistry）保留未删，行为与新装配对齐，待观察后评估删除。
+- 输入 / 输出：输入=插件实现（实现 VulcanPlugin 契约）；输出=CordisRuntime（ctx + tools/retrieval/agent 服务门面 + dispose）。
+- 依赖（前置模块）：config（按项目选择插件）、cordis/cosmokit npm 包。
+- 失败路径与降级：外部不可用（插件 setup 抛错）→ 启动 fail-fast（VULCAN_CORDIS_004，逆序回滚已挂载插件），拒绝带病启动；自身异常（运行期插件崩溃）→ AgentLoop 捕获记为工具失败，走任务失败/重试路径。
+- 验收标准：注册一个 mock 检索插件替换默认实现，任务全链路无感知完成，dispose 被调用一次；setup 抛错时已挂载插件逆序 dispose（test/cordis-runtime.test.ts 覆盖）。
 - 不启用时的行为：Cordis 是装配中枢，不可关闭；关闭等价于平台无执行层。
 
 ## 7. 接口与契约
@@ -280,7 +296,8 @@ vulcan-agent/
 | InternalEvent | `src/server/types.ts:14-26` | 三来源归一化事件，下游只面向此模型编程 |
 | ApprovalRequest / ApprovalDecision | `src/server/types.ts:62-80` | 审批输入与三态输出 |
 | TaskStatus 流转表 | harness 实现，枚举见 `src/server/types.ts:84-92` | 确定性流转，见 §10 |
-| VulcanPlugin / ToolPlugin / RetrievalPlugin | cordis 待实现 | 插件契约，setup/dispose 生命周期 |
+| VulcanPlugin / ToolPlugin / RetrievalPlugin | `src/server/cordis/index.ts` | 插件契约，setup/dispose 生命周期；经 `createCordisRuntime`（`cordis/bootstrap.ts`）包装为 cordis 插件挂载 |
+| CordisRuntime（ctx.tools / ctx.retrieval / ctx.agent） | `src/server/cordis/runtime.ts`、`cordis/bootstrap.ts` | 能力层 Service 门面：工具注册查询、检索链路（至多一条）、Agent 执行器绑定（`agent.bind(runner)`） |
 | 检索接口四项要求 | 《技术方案》4.2 | 权限前置过滤、版本坐标、哈希对齐、下载后核验 |
 
 错误模型：结构化错误三类——`ValidationError`（入参/签名不合法，4xx，不重试）、`TransientError`（外部超时/限流/5xx，可重试）、`PermanentError`（策略驳回/业务规则拒绝，不重试、需人工介入）。错误码规则 `VULCAN_<模块>_<序号>`，客户端（Webhook 调用方）处理：4xx 不重试、5xx 指数退避重试。
@@ -335,6 +352,9 @@ vulcan-agent/
 | `approval.autoPolicy.<project>` | config.yaml | 从严：未配置即全部转人工 | 否 | 首次裁决时校验 | 否 |
 | `alert.autofixAllowlist` | config.yaml | 空（默认只出建议） | 否 | 启动时 fail-fast | 否 |
 | `retry.maxAttempts` | config.yaml | 3 | 是 | 启动时 fail-fast | 否 |
+| `RAG_MCP_URL` | 环境变量 | 无（缺省走 stdio） | 否（缺失时长期记忆走 stdio 子进程模式） | 首次建连时校验 | 否 |
+| `RAG_MCP_COMMAND` / `RAG_MCP_ARGS` / `RAG_MCP_CWD` | 环境变量 | `python3` / `-m src.mcp_server.server` / 无 | 否（仅 stdio 模式） | 首次建连时校验 | 否 |
+| `RAG_MCP_TOKEN`（经 `RAG_MCP_TOKEN_ENV` 可改变量名） | 环境变量 | 无 | 否（http 模式鉴权用，缺失按无凭证连） | 首次建连时校验 | 是 |
 
 fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopback（硬约束：`config/config.yaml:4`）、`db.path` 不可写——任一命中拒绝启动。
 
@@ -479,6 +499,10 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 - [x] P3-1：cordis 插件契约与注册表（VulcanPlugin/ToolPlugin/RetrievalPlugin，setup/dispose）
   - 前置：P1-1
   - 验收：mock 插件替换默认实现全链路无感知；setup 抛错拒绝启动
+- [x] P3-1b：真·cordis v4 落地（参考 DSH，2026-09-30）
+  - 前置：P3-1
+  - 内容：npm `cordis@4.0.0-rc.10` 替换自研装配；能力层 Service（ctx.tools/ctx.retrieval/ctx.agent）+ 功能层插件（`{name, inject, apply}`）；entry.ts 接入 createCordisRuntime，SIGTERM 经 cordis.dispose() 优雅退出
+  - 验收：test/cordis-runtime.test.ts 7 用例全过（装配/空清单拒绝/重名拒绝/检索至多一/fail-fast 回滚/逆序 dispose/内置工具 scope 校验）；端到端启动冒烟通过（Cordis 装配→gateway→消费循环→优雅退出）
 - [x] P3-2：Pi AgentLoop 接入（ReAct 循环 + 工具白名单 + allowed repos/forbidden 约束）
   - 前置：P3-1
   - 验收：Agent 调用白名单外工具被拒并记审计；主模型无直接工作区访问路径
@@ -518,6 +542,9 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 - [x] P4-6：评测模式开关（清空/重置长期记忆召回 + 基线校验）
   - 前置：P4-2
   - 验收：评测跑批期间记忆召回为空，跑批后基线校验通过
+- [x] P4-7：长期记忆迁移 RAG 存储（MODULAR-RAG-MCP-SERVER，完全替换本地 SQLite memories 表）
+  - 前置：P4-2；配套 RAG 侧扩展（memory_manage 按 entry_ids 标 stale、user_preference kind、读路径过滤 stale）已落地并全绿
+  - 验收：memories 表从 migrate.ts 移除；召回走 memory_search、准入走 memory_store（带 governance 元数据）、失效/复核/评测清空走 memory_manage；RAG 不可达时熔断降级不阻塞主链路；全量 vitest 170/170 通过
 
 #### 阶段 5：大仓与评测（P5）
 
@@ -543,7 +570,12 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 | 自动审批策略过松导致误放行 | 生产事故 | 低（设计上从严） | 禁止项直接驳回不降级；策略默认未配置即全转人工；审计复盘持续调优 |
 | GVFS 大仓形态依赖企业索引服务排期 | P5 阻塞 | 中 | P5-1 独立成阶段，P1–P4 不被阻塞；普通项目形态先行 |
 
-踩坑记录：暂无（项目处于骨架阶段，尚未真实运行；首次踩坑后回填本节）。
+踩坑记录：
+
+1. **npm cordis v4 的 d.ts 在 `moduleResolution: Node16` 下类型解析失败**（2026-09-30）：`lib/*.d.ts` 使用无扩展名相对导入（`export * from './context'`），Node16 解析要求显式扩展名（TS2834），`skipLibCheck: true` 会静默吞掉解析错误 → 表现为 `Module '"cordis"' has no exported member 'Context'/'Service'`。规避：`src/types/cordis.d.ts` 用 ambient `declare module "cordis"` 手写最小类型面（declare class Context / abstract class Service）；将来迁移 `moduleResolution: bundler` 后可删除。注意 ambient 声明里 `interface` 只能当类型用、`class` 可当值；`plugin()` 返回类型若引用 `CordisPluginShape`（其 apply 参数引用 Context）会触发 TS1062 自引用，签名需写宽（unknown）。
+2. **cordis v4 服务属性读取必须显式 inject**：插件内读 `ctx.tools` 等服务属性，必须在插件上声明 `inject: ['tools']`，否则运行时抛 "cannot get property without inject"。对象插件的 dispose 方法不会被框架自动调用——资源回收必须走 `ctx.effect(() => disposer)`，由 fiber 卸载时逆序触发。
+3. **`--experimental-strip-types` 下纯类型导出必须 `import type`**：类型-only 导出（如 `PluginAugmentedContext`）混在值 import 语句里，直跑时按命名导出解析会崩（SyntaxError: does not provide an export named）。
+4. **pi-agent-core / pi-ai 必须动态 import**：静态导入会在 `--experimental-strip-types` ESM loader 下触发 typebox 递归模块图无限挂起（WorkBuddy 沙箱 shim 下 ~70-90s），`runAgentLoop` 与 `builtinModels()` 均推迟到首个修复任务的 `agent.run()` 内部加载（`src/server/agent/index.ts:11-13`、`src/server/cli/entry.ts:67-71`）。
 
 ## 16. 后续扩展
 
@@ -562,7 +594,7 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 |---|---|
 | 火哨 / Vulcan | 本平台名称；面向企业研发场景的告警处置 Agent |
 | Harness | 流程控制代码：校验、权限、路由、任务状态管理与审批裁决的编排层 |
-| Cordis | 插件化执行层：插件注册、依赖注入、装配与生命周期管理，本身不做模型推理 |
+| Cordis | 插件元框架底座（Koishi 生态，DeepSeek Harness 同款，npm `cordis@4`）：vulcan 执行层基于它实现插件注册、依赖注入（inject 声明）、装配（`createCordisRuntime`）与 fiber 生命周期管理，本身不做模型推理 |
 | AgentLoop | Agent 执行循环（默认 Pi）：模型提出动作→调工具→结果回喂→再请求模型 |
 | InternalEvent | 三来源（告警/meegle/审批）Webhook payload 归一化后的内部事件模型 |
 | GVFS | Virtual File System 虚拟仓库：本地只留元数据、内容按需下载的仓库形态 |
@@ -570,8 +602,9 @@ fail-fast：上表标必填且敏感的密钥缺失、`gateway.host` 非 loopbac
 | 本地增量覆盖 | 工作区层按 content_hash 修正远端检索结果对齐本地修改的机制 |
 | 结构化任务状态 | 恒定约 2K tokens 的任务现场文档：objective/progress/context/assumptions/todos/budget |
 | 短期记忆 | 任务生命周期的三层现场：结构化任务状态 + 近期对话原文 + 早期摘要 |
-| 长期记忆 | 跨任务可复用、有证据、有明确适用范围的四类记录（约束决策/修复案例/失败经验/协作偏好） |
+| 长期记忆 | 跨任务可复用、有证据、有明确适用范围的四类记录（约束决策/修复案例/失败经验/协作偏好）；存于 RAG 服务分区，非本地表 |
 | verification_status | 记忆验证状态：verified_by_test / verified_by_human / observed / unverified |
+| stale_status | 记忆失效状态（RAG schema v2）：active / stale（待复核，不进召回）/ retired；失效与裁定只改状态不改内容，保持可追溯 |
 | 禁止项 | 审批直接驳回（不降级人工）的变更类型：生产配置、数据迁移、跨仓、超大 diff、无验证证据 |
 | 三态裁决 | 审批输出：approved / rejected / manual |
 | 人工上下文包 | 转人工时给审批人的完整决策材料：意图/diff/影响范围/证据/关联单/建议与理由 |
